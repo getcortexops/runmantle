@@ -256,7 +256,7 @@ async def _exercise_process_integration() -> None:
             control = CortexOpsControlClient(
                 transport,
                 runtime_id="runmantle-process-test",
-                runtime_version="1.0.0rc1",
+                runtime_version="1.0.1",
             )
             handshake = control.register_runtime((WRITE,))
             assert handshake["runtime_id"] == "runmantle-process-test"

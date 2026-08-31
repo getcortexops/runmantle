@@ -1,4 +1,4 @@
-# Migrating from the developer preview to 1.0.0rc1
+# Migrating from the developer preview to 1.0.1
 
 The 1.0 release candidate keeps the existing worker, contract, verifier,
 durable runtime, action, approval, recovery, OpenAI adapter, and CortexOps APIs.
@@ -48,7 +48,7 @@ is not supported.
 
 ## Behavioral changes
 
-- The package version is `1.0.0rc1` and status is Beta/Release Candidate.
+- The package version is `1.0.1` and status is Beta.
 - The CLI keeps `runmantle demo` and adds `init`, `run`, `inspect`, `verify`,
   `resume`, and `doctor` for the packaged reference workflow.
 - `SafeJsonCodec` now applies default size, depth, and collection-count limits.

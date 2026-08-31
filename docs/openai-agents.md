@@ -1,6 +1,6 @@
 # OpenAI Agents SDK adapter
 
-Runmantle 1.0.0rc1 supports OpenAI Agents SDK 0.22 as an optional integration. The
+Runmantle 1.0.1 supports OpenAI Agents SDK 0.22 as an optional integration. The
 core package stays provider-neutral and does not import or install OpenAI.
 
 ```bash
