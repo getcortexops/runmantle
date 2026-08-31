@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "runmantle"
+version = "1.0.0rc1"
+description = "A durable, local-first verified execution layer for AI agents."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+  { name = "CortexOps" },
+]
+keywords = ["ai", "workers", "verification", "runtime", "evidence"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+cortexops = [
+  "cortexops-sdk>=0.1,<0.2",
+]
+openai-agents = [
+  "openai-agents>=0.22,<0.23",
+]
+dev = [
+  "build>=1.2",
+  "fastapi>=0.100",
+  "httpx>=0.24",
+  "mypy>=1.15",
+  "pytest>=8",
+  "ruff>=0.9",
+]
+
+[project.scripts]
+runmantle = "runmantle.cli:main"
+runmantle-hermes-control-install = "runmantle.integrations.hermes_control:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+runmantle = ["hermes_plugin/plugin.yaml"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+markers = [
+  "cortexops_integration: requires the real sibling CortexOps repository",
+  "cortexops_process_integration: opt-in separate-process CortexOps HTTP test",
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src/runmantle", "tests", "examples"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "BLE", "UP", "RUF"]

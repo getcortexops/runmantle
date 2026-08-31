@@ -1,0 +1,121 @@
+name: quality
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install development environment
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+      - name: Test
+        run: python -m pytest -m "not cortexops_integration"
+      - name: Lint
+        run: ruff check src tests examples
+      - name: Check formatting
+        run: ruff format --check src tests examples
+      - name: Type check
+        run: mypy
+      - name: Run installed CLI quickstart
+        run: |
+          fixture="$RUNNER_TEMP/release-guard"
+          runmantle init "$fixture" --json
+          cd "$fixture"
+          runmantle run --json || test $? -eq 3
+          runmantle verify --json || test $? -eq 4
+          runmantle resume --json || test $? -eq 5
+          runmantle resume --approve-current-plan --json
+          runmantle inspect --json
+
+  package-installation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+      - name: Install wheel in a clean environment
+        run: |
+          python -m venv "$RUNNER_TEMP/runmantle-install-test"
+          "$RUNNER_TEMP/runmantle-install-test/bin/python" -m pip install dist/*.whl
+      - name: Import and run installed package outside the source tree
+        working-directory: ${{ runner.temp }}
+        run: |
+          "$RUNNER_TEMP/runmantle-install-test/bin/python" -c "import runmantle; print(runmantle.__version__)"
+          fixture="$RUNNER_TEMP/installed-release-guard"
+          "$RUNNER_TEMP/runmantle-install-test/bin/runmantle" init "$fixture" --json
+          cd "$fixture"
+          "$RUNNER_TEMP/runmantle-install-test/bin/runmantle" run --json || test $? -eq 3
+          "$RUNNER_TEMP/runmantle-install-test/bin/runmantle" verify --json || test $? -eq 4
+          "$RUNNER_TEMP/runmantle-install-test/bin/runmantle" resume --json || test $? -eq 5
+          "$RUNNER_TEMP/runmantle-install-test/bin/runmantle" resume --approve-current-plan --json
+
+  cortexops-compatibility:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Runmantle
+        uses: actions/checkout@v4
+        with:
+          path: RunMantle
+      - name: Check out CortexOps
+        uses: actions/checkout@v4
+        with:
+          repository: getcortexops/CortexOps
+          path: CortexOps
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install both development environments
+        working-directory: RunMantle
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+          python -m pip install -e '../CortexOps[dev]'
+      - name: Run real cross-repository tests
+        working-directory: RunMantle
+        env:
+          CORTEXOPS_REPOSITORY: ${{ github.workspace }}/CortexOps
+          RUNMANTLE_CORTEXOPS_PROCESS_TEST: "1"
+        run: |
+          python -m pytest -m cortexops_integration
+          python -m pytest tests/test_cortexops_process_integration.py
+
+  openai-offline-adapter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install adapter test environment
+        run: python -m pip install -e '.[dev,openai-agents]'
+      - name: Run without API credentials or network model calls
+        env:
+          OPENAI_API_KEY: ""
+        run: |
+          python -m runmantle.openai_quickstart
+          python -m examples.verified_release_guard.openai_offline
+          python -m pytest tests/test_openai_agents.py tests/test_openai_release_guard.py
