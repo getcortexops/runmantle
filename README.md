@@ -6,7 +6,7 @@ report success until evidence verifies the outcome. Consequential actions and
 recovery remain capability-gated, durable, and auditable when they are routed
 through Runmantle's mediated boundary.
 
-Runmantle 1.0.0rc1 targets single-node production evaluation. It is not a
+Runmantle 1.0.0 targets single-node production evaluation. It is not a
 Python sandbox, distributed workflow engine, workforce manager, or fleet
 control plane. Organizational memory, knowledge graphs, dashboards, RBAC,
 scheduling, and workforce coordination belong to CortexOps, not Runmantle.
