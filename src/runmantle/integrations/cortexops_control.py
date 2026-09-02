@@ -633,7 +633,8 @@ class CortexOpsControlledActionExecutor:
             cancellation=cancellation,
             dry_run=dry_run,
         )
-        if result.action.receipt is not None and not dry_run:
+        receipt = result.action.receipt
+        if receipt is not None and not dry_run:
             # Receipt delivery failure must never repeat a side effect.  The
             # receipt is already durable in the mediated action store; callers
             # may safely invoke this executor again to replay delivery.
@@ -646,18 +647,18 @@ class CortexOpsControlledActionExecutor:
             except CortexOpsControlError:
                 return result
             if (
-                result.action.receipt.status is ActionExecutionStatus.EXECUTOR_SUCCEEDED
+                receipt.status is ActionExecutionStatus.EXECUTOR_SUCCEEDED
                 and self.post_action_confirmation_provider is not None
             ):
                 try:
                     confirmation = await self.post_action_confirmation_provider.confirm(
-                        request, result.action.receipt
+                        request, receipt
                     )
                     if (
                         confirmation.task_id != request.task_id
                         or confirmation.action_id != request.action_id
                         or confirmation.action_hash != request.action_hash
-                        or confirmation.receipt_id != result.action.receipt.receipt_id
+                        or confirmation.receipt_id != receipt.receipt_id
                     ):
                         raise CortexOpsControlRejected(
                             "post-action confirmation is not bound to this action "
@@ -681,7 +682,7 @@ class CortexOpsControlledActionExecutor:
                         task_id=request.task_id,
                         action_id=request.action_id,
                         action_hash=request.action_hash,
-                        receipt_id=result.action.receipt.receipt_id,
+                        receipt_id=receipt.receipt_id,
                         status=PostActionRuntimeConfirmationStatus.INCONCLUSIVE,
                         provider_id=type(
                             self.post_action_confirmation_provider

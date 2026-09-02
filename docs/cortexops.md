@@ -250,8 +250,7 @@ receipt, and has an independent `/health` + `/version`-style provider submit a
 post-action confirmation:
 
 ```bash
-RUNMANTLE_CORTEXOPS_PROCESS_TEST=1 CORTEXOPS_REPOSITORY=/path/to/cortexops \
-  ./.venv/bin/python -m pytest -q tests/test_cortexops_process_integration.py
+CORTEXOPS_REPOSITORY=../cortexops pytest -q
 ```
 
 It is a local fixture, not a production deployment. The provider intentionally
@@ -260,16 +259,14 @@ that queries their actual runtime.
 
 ### Separate-process compatibility test
 
-`RUNMANTLE_CORTEXOPS_PROCESS_TEST=1 pytest -q
-tests/test_cortexops_process_integration.py` starts the checked-out sibling
-CortexOps routers under Uvicorn in a separate process. It uses configured
-runtime/operator bearer identities, the Runmantle urllib HTTP transport,
-runtime and task registration, live policy evaluation, operator approval, one
-controlled action/receipt, and verified-status synchronization. It is opt-in
-and reports an explicit skip when the sibling checkout or local service
-environment is unavailable. This local test covers real HTTP and auth without
-TLS; it does not claim TLS termination, reverse-proxy, container-orchestrator,
-or remote-network coverage.
+The full local suite starts the checked-out sibling CortexOps routers under
+Uvicorn in a separate process. It uses configured runtime/operator bearer
+identities, the Runmantle urllib HTTP transport, runtime and task registration,
+live policy evaluation, operator approval, one controlled action/receipt, and
+verified-status synchronization. A missing or invalid checkout, or a service
+that cannot start, fails the suite instead of skipping compatibility coverage.
+This local test covers real HTTP and auth without TLS; it does not claim TLS
+termination, reverse-proxy, container-orchestrator, or remote-network coverage.
 - This first loop polls approval/recovery state; it has no push channel,
   background policy stream, distributed control outbox, TLS, or hosted identity
   service. CortexOps' documented local authentication and deployment limits

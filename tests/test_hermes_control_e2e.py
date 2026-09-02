@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from runmantle.integrations.cortexops_control import UrllibCortexOpsControlTransport
 from runmantle.integrations.hermes_control import (
     HermesControlAdapter,
     HermesControlConfig,
@@ -30,8 +31,9 @@ class _Context:
     def __init__(self) -> None:
         self.hooks: dict[str, object] = {}
         self.transport: object | None = None
+        self.settings: dict[str, Any] = {}
 
-    def get_config(self, key: str):
+    def get_config(self, key: str) -> Any:
         return self.settings.get(key)
 
     def register_hook(self, name: str, callback: object) -> None:
@@ -64,10 +66,6 @@ def _adapter(base_url: str, state_path: Path) -> HermesControlAdapter:
     )
 
 
-@pytest.mark.skipif(
-    os.environ.get("RUNMANTLE_CORTEXOPS_PROCESS_TEST") != "1",
-    reason="set RUNMANTLE_CORTEXOPS_PROCESS_TEST=1 to start local CortexOps",
-)
 def test_hermes_hook_to_cortexops_approve_then_deny(tmp_path: Path) -> None:
     # Reuse the checked-in Uvicorn fixture; neither CortexOps nor Hermes core changes.
     from tests.test_cortexops_process_integration import (
@@ -77,7 +75,9 @@ def test_hermes_hook_to_cortexops_approve_then_deny(tmp_path: Path) -> None:
 
     with _cortexops_process(tmp_path) as base_url:
         adapter = _adapter(base_url, tmp_path / "adapter.sqlite")
-        assert adapter.client.transport.base_url == base_url
+        transport = adapter.client.transport
+        assert isinstance(transport, UrllibCortexOpsControlTransport)
+        assert transport.base_url == base_url
         call = {
             "tool_name": "terminal",
             "args": {"path": "/tmp/a"},
@@ -104,7 +104,9 @@ def test_hermes_hook_to_cortexops_approve_then_deny(tmp_path: Path) -> None:
         adapter.post_tool_call(**call, status="ok", result="executed", duration_ms=1)
         # A second action has an independent projection and a Deny never invokes it.
         call["tool_call_id"] = "call-2"
-        assert adapter.pre_tool_call(**call)["action"] == "approve"
+        result = adapter.pre_tool_call(**call)
+        assert result is not None
+        assert result["action"] == "approve"
         with adapter._db() as db:
             row = db.execute(
                 "SELECT approval_id,action_hash FROM hermes_actions "

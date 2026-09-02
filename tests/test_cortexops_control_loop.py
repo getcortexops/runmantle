@@ -63,22 +63,6 @@ from runmantle.integrations.cortexops_control import (
 )
 
 pytestmark = pytest.mark.cortexops_integration
-try:
-    configure_cortexops_workspace()
-except RuntimeError as error:
-    pytest.skip(str(error), allow_module_level=True)
-
-FastAPI = import_module("fastapi").FastAPI
-TestClient = import_module("fastapi.testclient").TestClient
-create_openclaw_plugin_router = import_module(
-    "cortexops.openclaw_plugin"
-).create_openclaw_plugin_router
-OpenClawPluginRepository = import_module(
-    "cortexops.openclaw_plugin.repository"
-).OpenClawPluginRepository
-create_runmantle_control_router = import_module(
-    "cortexops.runmantle_control"
-).create_runmantle_control_router
 
 WRITE_CAPABILITY = "write_file"
 RUNTIME_HEADERS = {"Authorization": "Bearer runtime-token"}
@@ -179,8 +163,20 @@ def control_harness(
     mode: str = "control",
     data_mode: str = "live",
 ) -> tuple[Any, CortexOpsControlClient, Any, Path]:
+    configure_cortexops_workspace()
+    fast_api = import_module("fastapi").FastAPI
+    test_client = import_module("fastapi.testclient").TestClient
+    create_openclaw_plugin_router = import_module(
+        "cortexops.openclaw_plugin"
+    ).create_openclaw_plugin_router
+    openclaw_plugin_repository = import_module(
+        "cortexops.openclaw_plugin.repository"
+    ).OpenClawPluginRepository
+    create_runmantle_control_router = import_module(
+        "cortexops.runmantle_control"
+    ).create_runmantle_control_router
     db_path = Path(directory) / "cortexops.db"
-    plugin = OpenClawPluginRepository(db_path)
+    plugin = openclaw_plugin_repository(db_path)
     plugin.save_policy(policy(effect))
     identities = json.dumps(
         [
@@ -205,10 +201,10 @@ def control_harness(
         os.environ,
         {"CORTEXOPS_GOVERNANCE_IDENTITIES_JSON": identities},
     ):
-        app = FastAPI()
+        app = fast_api()
         app.include_router(create_openclaw_plugin_router(db_path))
         app.include_router(create_runmantle_control_router(db_path))
-    http = TestClient(app)
+    http = test_client(app)
     control = CortexOpsControlClient(
         ControlTestTransport(http),
         runtime_id="runmantle-test-runtime",
@@ -574,7 +570,9 @@ class CortexOpsControlLoopIntegrationTest(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertEqual(calls, 1)
-            self.assertIsNotNone(result.action.receipt)
+            receipt = result.action.receipt
+            self.assertIsNotNone(receipt)
+            assert receipt is not None
             self.assertIsNotNone(result.post_action_confirmation)
             self.assertFalse(result.verified_outcome)
             with __import__("sqlite3").connect(cortex_path) as database:
@@ -583,9 +581,7 @@ class CortexOpsControlLoopIntegrationTest(unittest.IsolatedAsyncioTestCase):
                     "FROM runmantle_action_runtime_confirmations"
                 ).fetchone()
             self.assertEqual(row[0], "confirmed")
-            self.assertEqual(
-                row[1], f"{control.runtime_id}:{result.action.receipt.receipt_id}"
-            )
+            self.assertEqual(row[1], f"{control.runtime_id}:{receipt.receipt_id}")
             self.assertIn("runtime-health", row[2])
 
     async def test_recognized_block_never_invokes_handler(self) -> None:

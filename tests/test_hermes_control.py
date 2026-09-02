@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any, cast
 
+from runmantle.actions import ActionRequest
 from runmantle.integrations.cortexops_control import CortexOpsControlError
 from runmantle.integrations.hermes_control import (
     HermesControlAdapter,
@@ -10,14 +13,30 @@ from runmantle.integrations.hermes_control import (
 
 
 class _Transport:
-    def __init__(self, status="Approved", mismatch=False, fails=False):
-        self.status, self.mismatch, self.fails, self.calls = status, mismatch, fails, []
+    def __init__(
+        self,
+        status: str = "Approved",
+        mismatch: bool = False,
+        fails: bool = False,
+    ) -> None:
+        self.status = status
+        self.mismatch = mismatch
+        self.fails = fails
+        self.calls: list[tuple[str, str]] = []
+        self.action_id = ""
+        self.action_hash = ""
 
-    def request(self, method, path, payload=None):
+    def request(
+        self,
+        method: str,
+        path: str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         self.calls.append((method, path))
         if self.fails and path.startswith("/api/runmantle/v1/approvals/"):
             raise CortexOpsControlError("offline")
         if path.startswith("/api/runmantle/v1/actions/d1/approval"):
+            assert payload is not None
             return {
                 "approval_id": "a1",
                 "governance_approval_id": "g1",
@@ -44,18 +63,16 @@ class _Transport:
 
 
 class _Client:
-    def __init__(self, outcome="REQUIRE_APPROVAL", **options):
-        self.outcome, self._handshake, self.dispatched, self.transport = (
-            outcome,
-            {"policy": {}},
-            [],
-            _Transport(**options),
-        )
+    def __init__(self, outcome: str = "REQUIRE_APPROVAL", **options: Any) -> None:
+        self.outcome = outcome
+        self._handshake: dict[str, Any] = {"policy": {}}
+        self.dispatched: list[str] = []
+        self.transport = _Transport(**options)
 
-    def register_runtime(self, *_):
+    def register_runtime(self, *_: Any) -> dict[str, Any]:
         return self._handshake
 
-    def evaluate_action(self, request, **_):
+    def evaluate_action(self, request: ActionRequest, **_: Any) -> dict[str, Any]:
         self.transport.action_id, self.transport.action_hash = (
             request.action_id,
             request.action_hash,
@@ -66,7 +83,7 @@ class _Client:
             "action_hash": request.action_hash,
         }
 
-    def action_decision(self, _id, action_hash):
+    def action_decision(self, _id: str, action_hash: str) -> dict[str, Any]:
         return {
             "decision_id": "d1",
             "outcome": "REQUIRE_APPROVAL",
@@ -74,7 +91,13 @@ class _Client:
             "approval": {"approval_id": "g1", "permit_id": "p", "permit_hash": "h"},
         }
 
-    def dispatch_action(self, _decision, *, action_hash, attempt_id):
+    def dispatch_action(
+        self,
+        _decision: Mapping[str, Any],
+        *,
+        action_hash: str,
+        attempt_id: str,
+    ) -> dict[str, Any]:
         self.dispatched.append(attempt_id)
         return {
             "state": "DISPATCHED",
@@ -84,18 +107,22 @@ class _Client:
 
 
 class _Request:
-    def __init__(self, call_id="c", request_id="r1", digest="digest"):
+    def __init__(
+        self, call_id: str = "c", request_id: str = "r1", digest: str = "digest"
+    ) -> None:
         self.pattern_key, self.request_id, self.digest = (
             f"plugin_rule:cortexops:{call_id}",
             request_id,
             digest,
         )
 
-    def respond(self, choice):
+    def respond(self, choice: str) -> str:
         return choice
 
 
-def _adapter(tmp_path: Path, outcome="REQUIRE_APPROVAL", **options):
+def _adapter(
+    tmp_path: Path, outcome: str = "REQUIRE_APPROVAL", **options: Any
+) -> tuple[HermesControlAdapter, _Client]:
     config = HermesControlConfig.from_settings(
         {
             "cortexops_url": "http://127.0.0.1:9",
@@ -108,31 +135,37 @@ def _adapter(tmp_path: Path, outcome="REQUIRE_APPROVAL", **options):
     )
     adapter = HermesControlAdapter(config)
     client = _Client(outcome, **options)
-    adapter.client = client
+    adapter.client = cast(Any, client)
     return adapter, client
 
 
-def _call():
-    return dict(
-        tool_name="terminal",
-        args={"command": "deploy", "token": "secret"},
-        task_id="t",
-        session_id="s",
-        tool_call_id="c",
-    )
+def _call() -> dict[str, Any]:
+    return {
+        "tool_name": "terminal",
+        "args": {"command": "deploy", "token": "secret"},
+        "task_id": "t",
+        "session_id": "s",
+        "tool_call_id": "c",
+    }
 
 
-def test_approved_dispatches_once_and_is_request_bound(tmp_path):
+def _assert_approval(adapter: HermesControlAdapter) -> None:
+    result = adapter.pre_tool_call(**_call())
+    assert result is not None
+    assert result["action"] == "approve"
+
+
+def test_approved_dispatches_once_and_is_request_bound(tmp_path: Path) -> None:
     adapter, client = _adapter(tmp_path)
-    assert adapter.pre_tool_call(**_call())["action"] == "approve"
+    _assert_approval(adapter)
     assert adapter.present_approval(_Request()) == "once"
     assert client.dispatched == ["r1"]
     assert adapter.present_approval(_Request()) == "deny"
     assert client.dispatched == ["r1"]
 
 
-def test_denied_expired_timeout_and_api_failure_fail_closed(tmp_path):
-    cases = (
+def test_denied_expired_timeout_and_api_failure_fail_closed(tmp_path: Path) -> None:
+    cases: tuple[tuple[str, dict[str, Any]], ...] = (
         ("Denied", {"status": "Denied"}),
         ("Expired", {"status": "Expired"}),
         ("Pending", {"status": "Pending", "approval_timeout_seconds": 0.003}),
@@ -140,26 +173,28 @@ def test_denied_expired_timeout_and_api_failure_fail_closed(tmp_path):
     )
     for name, options in cases:
         adapter, client = _adapter(tmp_path / name, **options)
-        assert adapter.pre_tool_call(**_call())["action"] == "approve"
+        _assert_approval(adapter)
         assert adapter.present_approval(_Request()) == "deny"
         assert client.dispatched == []
 
 
-def test_hash_mismatch_and_stale_request_are_blocked(tmp_path):
+def test_hash_mismatch_and_stale_request_are_blocked(tmp_path: Path) -> None:
     adapter, client = _adapter(tmp_path, mismatch=True)
-    assert adapter.pre_tool_call(**_call())["action"] == "approve"
+    _assert_approval(adapter)
     assert adapter.present_approval(_Request()) == "deny"
     assert client.dispatched == []
     adapter, client = _adapter(tmp_path / "stale")
-    assert adapter.pre_tool_call(**_call())["action"] == "approve"
+    _assert_approval(adapter)
     assert adapter.present_approval(_Request(request_id="first")) == "once"
     assert adapter.present_approval(_Request(request_id="second")) == "deny"
     assert client.dispatched == ["first"]
 
 
-def test_delivery_retry_never_reexecutes_and_receipt_is_post_execution(tmp_path):
+def test_delivery_retry_never_reexecutes_and_receipt_is_post_execution(
+    tmp_path: Path,
+) -> None:
     adapter, client = _adapter(tmp_path)
-    assert adapter.pre_tool_call(**_call())["action"] == "approve"
+    _assert_approval(adapter)
     assert adapter.present_approval(_Request()) == "once"
     assert not any("/receipts" in path for _, path in client.transport.calls)
     adapter.post_tool_call(**_call(), status="ok", result="done", duration_ms=1)
@@ -168,7 +203,7 @@ def test_delivery_retry_never_reexecutes_and_receipt_is_post_execution(tmp_path)
     assert client.dispatched == ["r1"]
 
 
-def test_allow_dispatches_once_and_persists_redacted_identity(tmp_path):
+def test_allow_dispatches_once_and_persists_redacted_identity(tmp_path: Path) -> None:
     adapter, client = _adapter(tmp_path, "ALLOW")
     assert adapter.pre_tool_call(**_call()) is None
     assert adapter.pre_tool_call(**_call()) is None

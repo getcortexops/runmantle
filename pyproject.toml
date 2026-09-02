@@ -36,8 +36,10 @@ dev = [
   "fastapi>=0.100",
   "httpx>=0.24",
   "mypy>=1.15",
+  "openai-agents>=0.22,<0.23",
   "pytest>=8",
   "ruff>=0.9",
+  "uvicorn>=0.24",
 ]
 
 [project.scripts]
@@ -55,7 +57,7 @@ addopts = "-ra"
 testpaths = ["tests"]
 markers = [
   "cortexops_integration: requires the real sibling CortexOps repository",
-  "cortexops_process_integration: opt-in separate-process CortexOps HTTP test",
+  "cortexops_process_integration: separate-process CortexOps HTTP test",
 ]
 
 [tool.mypy]

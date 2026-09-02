@@ -20,12 +20,16 @@ from typing import Any
 from urllib.request import Request, urlopen
 
 from runmantle.actions import ActionRequest
-from runmantle.contracts import RiskLevel
+from runmantle.contracts import RiskLevel, TaskContract
+from runmantle.evidence import EvidenceRequirement
 from runmantle.integrations.cortexops_control import (
     CortexOpsControlClient,
     CortexOpsControlError,
     UrllibCortexOpsControlTransport,
+    _digest,
 )
+from runmantle.telemetry import task_contract_telemetry
+from runmantle.verification import FieldEqualsCriterion
 
 
 def _canonical(value: Mapping[str, Any]) -> str:
@@ -57,6 +61,69 @@ def redact(value: Any, keys: frozenset[str]) -> Any:
     return value
 
 
+def _expected_leaves(
+    value: Mapping[str, Any], prefix: str = ""
+) -> list[tuple[str, Any]]:
+    leaves: list[tuple[str, Any]] = []
+    for key in sorted(value):
+        path = f"{prefix}.{key}" if prefix else str(key)
+        item = value[key]
+        if isinstance(item, Mapping):
+            leaves.extend(_expected_leaves(item, path))
+        else:
+            leaves.append((path, item))
+    return leaves
+
+
+def hermes_task_contract(
+    task_id: str,
+    session_id: str,
+    *,
+    capability: str,
+    risk_level: RiskLevel,
+    expected_state: Mapping[str, Any],
+) -> TaskContract[dict[str, str], dict[str, bool]]:
+    """Build the immutable task contract shared by the plugin and verifier."""
+
+    evidence_type = "hermes_deployment_runtime"
+    criteria: list[Any] = [
+        FieldEqualsCriterion(
+            name="hermes_execution_reported",
+            description="Hermes reported that the governed tool returned successfully.",
+            field_path="executed",
+            expected=True,
+        )
+    ]
+    criteria.extend(
+        FieldEqualsCriterion(
+            name=f"postcondition_{path.replace('.', '_')}",
+            description=f"The runtime probe must observe {path!r} exactly.",
+            field_path=path,
+            expected=expected,
+            evidence_type=evidence_type,
+        )
+        for path, expected in _expected_leaves(expected_state)
+    )
+    return TaskContract(
+        task_id=task_id,
+        objective="Verify one CortexOps-governed Hermes deployment action.",
+        input={"session_id": session_id},
+        acceptance_criteria=tuple(criteria),
+        required_evidence=(
+            EvidenceRequirement(
+                evidence_type,
+                "Fresh runtime observations from the deployment version and "
+                "health probes.",
+            ),
+        ),
+        allowed_capabilities=frozenset({capability}),
+        risk_level=risk_level,
+        timeout=timedelta(minutes=10),
+        idempotency_key=f"hermes:{task_id}:verified-once",
+        metadata={"runtime": "hermes", "session_id": session_id},
+    )
+
+
 @dataclass(frozen=True)
 class HermesControlConfig:
     cortexops_url: str
@@ -69,6 +136,7 @@ class HermesControlConfig:
     approval_timeout_seconds: float = 300
     approval_poll_initial_seconds: float = 0.25
     approval_poll_max_seconds: float = 2
+    blocking_hook_approval: bool = False
     redact_keys: frozenset[str] = frozenset(
         {"authorization", "token", "secret", "password", "api_key"}
     )
@@ -105,6 +173,7 @@ class HermesControlConfig:
             float(settings.get("approval_timeout_seconds") or 300),
             initial,
             maximum,
+            settings.get("blocking_hook_approval") is True,
             frozenset(str(v).lower() for v in (settings.get("redact_keys") or []))
             or cls.redact_keys,
         )
@@ -152,17 +221,33 @@ class HermesControlAdapter:
     def _approval_rule(call_id: str) -> str:
         return f"cortexops:{call_id}"
 
-    def _register_task(self, task_id: str, session_id: str) -> None:
+    def _register_task(
+        self,
+        contract: TaskContract[dict[str, str], dict[str, bool]],
+        session_id: str,
+    ) -> None:
+        request_id = (
+            f"runtime:{self.config.runtime_id}:hermes-task:{contract.task_id}:register"
+        )
+        register_task = getattr(self.client, "register_task", None)
+        if callable(register_task):
+            register_task(
+                contract,
+                correlation_id=session_id,
+                worker_id="hermes",
+                request_id=request_id,
+            )
+            return
+        # Compatibility for injected v1-style clients that expose only the
+        # transport seam (including existing application test doubles).
         self.client.transport.request(
             "POST",
             "/api/runmantle/v1/tasks/register",
             {
-                "request_id": (
-                    f"runtime:{self.config.runtime_id}:hermes-task:{task_id}:register"
-                ),
+                "request_id": request_id,
                 "runtime_id": self.config.runtime_id,
-                "task_id": task_id,
-                "contract_hash": _hash({"task_id": task_id, "session_id": session_id}),
+                "task_id": contract.task_id,
+                "contract_hash": _digest(task_contract_telemetry(contract)),
                 "correlation_id": session_id,
                 "worker_id": "hermes",
             },
@@ -173,7 +258,8 @@ class HermesControlAdapter:
         tool = self._tool(tool_name)
         if tool is None:
             return None
-        args = kw.get("args") if isinstance(kw.get("args"), Mapping) else {}
+        raw_args = kw.get("args")
+        args: Mapping[str, Any] = raw_args if isinstance(raw_args, Mapping) else {}
         call_id, task_id, session_id = (
             str(kw.get(k) or "") for k in ("tool_call_id", "task_id", "session_id")
         )
@@ -231,6 +317,19 @@ class HermesControlAdapter:
                 "args_hash": args_hash,
             },
         )
+        probe = self.config.post_action_probes.get(tool_name)
+        expected_state: Mapping[str, Any] = {}
+        if isinstance(probe, Mapping):
+            configured_expected = probe.get("expected_state")
+            if isinstance(configured_expected, Mapping):
+                expected_state = configured_expected
+        contract = hermes_task_contract(
+            task_id,
+            session_id,
+            capability=request.required_capability,
+            risk_level=request.risk_level,
+            expected_state=expected_state,
+        )
         try:
             if not getattr(self.client, "_handshake", None):
                 capabilities = {
@@ -240,7 +339,7 @@ class HermesControlAdapter:
                 }
                 capabilities.update({"govern.v2", "govern.receipt.v1"})
                 self.client.register_runtime(capabilities)
-            self._register_task(task_id, session_id)
+            self._register_task(contract, session_id)
             decision = self.client.evaluate_action(
                 request, correlation_id=session_id, worker_id="hermes"
             )
@@ -303,6 +402,34 @@ class HermesControlAdapter:
                         "UPDATE hermes_actions SET approval_id=? WHERE tool_call_id=?",
                         (approval["approval_id"], call_id),
                     )
+                if self.config.blocking_hook_approval:
+                    request_id = f"hermes-blocking-hook:{call_id}"
+                    pattern_key = f"plugin_rule:{self._approval_rule(call_id)}"
+                    request_digest = _hash(
+                        {
+                            "call_id": call_id,
+                            "action_hash": request.action_hash,
+                            "request_id": request_id,
+                        }
+                    )
+
+                    class BlockingHookRequest:
+                        def __init__(self) -> None:
+                            self.pattern_key = pattern_key
+                            self.request_id = request_id
+                            self.digest = request_digest
+
+                        @staticmethod
+                        def respond(choice: str) -> str:
+                            return choice
+
+                    choice = self.present_approval(BlockingHookRequest())
+                    if choice == "once":
+                        return None
+                    return {
+                        "action": "block",
+                        "message": "BLOCKED: CortexOps did not approve this action",
+                    }
                 return {
                     "action": "approve",
                     "message": "CortexOps approval required",
@@ -498,13 +625,14 @@ class HermesControlAdapter:
                     (row["tool_call_id"],),
                 )
 
-    def _send_probe(self, row: Mapping[str, Any], kw: Mapping[str, Any]) -> bool:
+    def _send_probe(self, row: sqlite3.Row, kw: Mapping[str, Any]) -> bool:
         probe = (self.config.post_action_probes or {}).get(
             str(kw.get("tool_name") or "")
         )
         if not isinstance(probe, Mapping):
             return True
         observed: dict[str, Any] = {}
+        expected = dict(probe.get("expected_state") or {})
         status = "confirmed"
         try:
             for label in ("version_url", "health_url"):
@@ -516,21 +644,29 @@ class HermesControlAdapter:
                     timeout=self.config.decision_timeout_seconds,
                 ) as response:
                     observed[label.removesuffix("_url")] = json.loads(response.read())
+            if observed != expected:
+                status = "failed"
         except Exception as error:  # noqa: BLE001 - probes are non-authoritative evidence
             status, observed = "inconclusive", {"probe_error": type(error).__name__}
+        receipt = json.loads(row["receipt_json"]) if row["receipt_json"] else {}
         payload = {
             "message_id": f"hermes:{row['tool_call_id']}:probe",
             "runtime_id": self.config.runtime_id,
             "task_id": str(kw.get("task_id") or ""),
             "action_id": row["action_id"],
             "action_hash": row["action_hash"],
-            "receipt_id": f"{self.config.runtime_id}:hermes:{row['tool_call_id']}",
+            "receipt_id": str(
+                receipt.get("receipt_id") or f"hermes:{row['tool_call_id']}"
+            ),
             "confirmation_id": f"hermes:{row['tool_call_id']}:probe",
             "status": status,
             "provider_id": "runmantle.hermes.http_probe",
             "observed_state": observed,
-            "expected_state": dict(probe.get("expected_state") or {}),
-            "evidence_ids": [],
+            "expected_state": expected,
+            "evidence_ids": [
+                f"hermes:{row['tool_call_id']}:version",
+                f"hermes:{row['tool_call_id']}:health",
+            ],
             "checked_at": datetime.now(UTC).isoformat(),
             "actor": "runmantle.hermes_control",
         }
@@ -557,6 +693,7 @@ def register(ctx: Any) -> None:
         "approval_timeout_seconds",
         "approval_poll_initial_seconds",
         "approval_poll_max_seconds",
+        "blocking_hook_approval",
         "redact_keys",
     )
     adapter = HermesControlAdapter(
@@ -592,3 +729,14 @@ def main() -> int:
     args = parser.parse_args()
     print(install_plugin(args.hermes_home))
     return 0
+
+
+__all__ = [
+    "HermesControlAdapter",
+    "HermesControlConfig",
+    "hermes_task_contract",
+    "install_plugin",
+    "main",
+    "redact",
+    "register",
+]

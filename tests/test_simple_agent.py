@@ -6,7 +6,6 @@ from tempfile import TemporaryDirectory
 
 import pytest
 
-from examples.cortexops_workspace import cortexops_workspace_available
 from examples.simple_agent.agent import (
     FAILED_FIXTURE,
     OBJECTIVE,
@@ -128,10 +127,6 @@ class SimpleAgentTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn(required.value, event_types)
 
     @pytest.mark.cortexops_integration
-    @pytest.mark.skipif(
-        not cortexops_workspace_available(),
-        reason="real CortexOps checkout unavailable",
-    )
     async def test_real_cortexops_sdk_parses_every_exported_event(self) -> None:
         with TemporaryDirectory() as directory:
             result = await run_release_readiness_agent(

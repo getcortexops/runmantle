@@ -8,7 +8,6 @@ from typing import Any
 
 import pytest
 
-from examples.cortexops_workspace import cortexops_workspace_available
 from examples.incident_response_demo import (
     run_incident_response_demo,
     validate_cortexops_jsonl,
@@ -128,10 +127,6 @@ class IncidentResponseDemoTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(lifecycle_events[-1]["state"], TaskStatus.VERIFIED.value)
 
     @pytest.mark.cortexops_integration
-    @pytest.mark.skipif(
-        not cortexops_workspace_available(),
-        reason="real CortexOps checkout unavailable",
-    )
     async def test_real_cortexops_sdk_parser_accepts_complete_jsonl(self) -> None:
         with TemporaryDirectory() as directory:
             result = await run_incident_response_demo(

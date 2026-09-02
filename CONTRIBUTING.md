@@ -31,25 +31,29 @@ python -m pip install -e '.[dev]'
 
 On Windows, activate the environment with `.venv\Scripts\activate`.
 
+The development extra includes the supported OpenAI Agents SDK range and
+Uvicorn because strict type checking covers the optional adapter and the real
+CortexOps process fixture. They remain outside the core runtime dependencies.
+
 ## Quality checks
 
 Run all checks before opening a pull request:
 
 ```bash
-python -m pytest -m "not cortexops_integration"
+python -m pytest -m "not cortexops_integration and not cortexops_process_integration"
 ruff check src tests examples
 ruff format --check src tests examples
 mypy
 python -m build
 ```
 
-That is the standalone-checkout suite. Real CortexOps tests are explicitly
-marked and require its actual sibling repository:
+That is the standalone-checkout suite. The full local suite expects a real
+CortexOps checkout at the lowercase sibling path `../cortexops`. Only
+`CORTEXOPS_REPOSITORY` can override that path. The compatibility, process, and
+Hermes E2E tests fail with a checkout diagnostic if it is absent or invalid:
 
 ```bash
-CORTEXOPS_REPOSITORY=../CortexOps python -m pytest -m cortexops_integration
-RUNMANTLE_CORTEXOPS_PROCESS_TEST=1 CORTEXOPS_REPOSITORY=../CortexOps \
-  python -m pytest tests/test_cortexops_process_integration.py
+CORTEXOPS_REPOSITORY=../cortexops pytest -q
 ```
 
 CI uses a separate combined-workspace job to check out and install CortexOps.

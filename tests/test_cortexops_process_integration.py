@@ -47,7 +47,6 @@ from runmantle.evidence import _establish_evidence_origin
 from runmantle.integrations.cortexops_control import (
     CortexOpsControlClient,
     CortexOpsControlledActionExecutor,
-    CortexOpsControlUnavailable,
     UrllibCortexOpsControlTransport,
 )
 
@@ -160,12 +159,9 @@ def _operator_post(base_url: str, path: str, payload: dict[str, Any]) -> None:
 
 @contextmanager
 def _cortexops_process(root: Path) -> Iterator[str]:
-    try:
-        cortexops = configure_cortexops_workspace()
-        __import__("fastapi")
-        __import__("uvicorn")
-    except (ImportError, RuntimeError) as error:
-        pytest.skip(f"CortexOps process environment unavailable: {error}")
+    cortexops = configure_cortexops_workspace()
+    __import__("fastapi")
+    __import__("uvicorn")
 
     port = _free_port()
     base_url = f"http://127.0.0.1:{port}"
@@ -220,9 +216,10 @@ def _cortexops_process(root: Path) -> Iterator[str]:
                 log.flush()
                 log.seek(0)
                 detail = log.read()[-2000:]
-                pytest.skip(
+                pytest.fail(
                     "CortexOps separate process could not be started locally: "
-                    f"{detail or 'no diagnostic output'}"
+                    f"{detail or 'no diagnostic output'}",
+                    pytrace=False,
                 )
             with pytest.raises(HTTPError) as unauthorized:
                 urlopen(
@@ -241,11 +238,6 @@ def _cortexops_process(root: Path) -> Iterator[str]:
 
 
 async def _exercise_process_integration() -> None:
-    if os.environ.get("RUNMANTLE_CORTEXOPS_PROCESS_TEST") != "1":
-        pytest.skip(
-            "set RUNMANTLE_CORTEXOPS_PROCESS_TEST=1 to start the local "
-            "CortexOps process"
-        )
     with TemporaryDirectory() as directory:
         root = Path(directory)
         with _cortexops_process(root) as base_url:
@@ -400,7 +392,4 @@ async def _exercise_process_integration() -> None:
 
 
 def test_real_cortexops_process_http_control_round_trip() -> None:
-    try:
-        asyncio.run(_exercise_process_integration())
-    except CortexOpsControlUnavailable as error:
-        pytest.skip(f"CortexOps process environment became unavailable: {error}")
+    asyncio.run(_exercise_process_integration())

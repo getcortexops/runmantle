@@ -57,9 +57,51 @@ hermes plugins enable runmantle-cortexops-control
 hermes chat
 
 # Automated local HTTP E2E (Approve and Deny)
-RUNMANTLE_CORTEXOPS_PROCESS_TEST=1 CORTEXOPS_REPOSITORY=/path/to/cortexops \
-  ./.venv/bin/python -m pytest -q tests/test_hermes_control_e2e.py
+CORTEXOPS_REPOSITORY=../cortexops pytest -q
 ```
 
-The E2E fixture exercises both approve (one execution, receipt, runtime
-confirmation) and deny (no execution) against the local CortexOps API.
+The full local suite includes the E2E fixture, exercising both approve (one
+execution, receipt, runtime confirmation) and deny (no execution) against the
+local CortexOps API.
+
+## One-command local proof
+
+From the RunMantle checkout, with `cortexops` and `hermes-agent` checkouts next
+to the directory containing the RunMantle checkout, run:
+
+```bash
+./.venv/bin/python scripts/hermes_cortexops_demo.py
+```
+
+Override checkout locations with `CORTEXOPS_REPOSITORY` and
+`HERMES_REPOSITORY`. The runner builds a RunMantle wheel, creates a clean
+temporary virtual environment and `HERMES_HOME`, installs and enables the
+plugin with the real Hermes CLI, and starts authenticated CortexOps plus an
+isolated local version/health service. It executes both operator outcomes and
+writes the exact Hermes command, pending approval snapshot, logs, SQLite
+databases, and combined audit trace below
+`artifacts/hermes-cortexops-demo/<UTC timestamp>/`. CortexOps listens on the
+loopback URL recorded as `cortexops_url` in each scenario trace and is stopped
+when the proof completes.
+
+Hermes v0.20.5 does not apply a selected approval transport to an `approve`
+directive returned by `pre_tool_call`; that path opens its built-in prompt.
+The demo therefore enables `blocking_hook_approval: true`. In this compatibility
+mode the RunMantle hook blocks the same Hermes tool call while it polls the real
+CortexOps pending approval, validates the exact action permit, consumes it once,
+and only then returns control to Hermes. No inter-service response is mocked.
+
+Troubleshooting:
+
+- Hermes requires Python below 3.14; the runner prefers `python3.13` and then
+  the Hermes checkout's `.venv/bin/python`.
+- If a checkout is elsewhere, set its repository environment variable rather
+  than editing the script or a global Hermes config.
+- Port conflicts are avoided with loopback ephemeral ports. Inspect
+  `cortexops.log`, `hermes.log`, and `deployment.log` in the newest artifact
+  directory if a child process exits.
+- CortexOps's full dashboard currently fails to import on Python 3.13 because
+  of its `threading.RLock | None` annotation. The runner mounts its official
+  authenticated RunMantle/OpenClaw routers in FastAPI, which provides the same
+  real database, policy, operator endpoints, and `/docs` API without the broken
+  dashboard module.

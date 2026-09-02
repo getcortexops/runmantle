@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
@@ -12,8 +13,8 @@ from unittest.mock import patch
 import pytest
 
 from examples.cortexops_workspace import (
+    DEFAULT_CORTEXOPS_REPOSITORY,
     configure_cortexops_workspace,
-    cortexops_workspace_available,
 )
 from runmantle import (
     CapabilityDeclaration,
@@ -360,6 +361,34 @@ class CortexOpsMappingTest(unittest.TestCase):
 
 
 class CortexOpsBridgeTest(unittest.IsolatedAsyncioTestCase):
+    def test_default_repository_is_lowercase_sibling(self) -> None:
+        self.assertEqual(
+            DEFAULT_CORTEXOPS_REPOSITORY,
+            Path(__file__).resolve().parents[1].parent / "cortexops",
+        )
+
+    def test_explicit_repository_path_never_falls_back_to_another_checkout(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cases = (
+                (Path(directory) / "missing", "directory does not exist"),
+                (Path(directory), "missing .git checkout metadata"),
+            )
+            for repository, detail in cases:
+                with self.subTest(detail=detail):
+                    with patch.dict(
+                        os.environ,
+                        {"CORTEXOPS_REPOSITORY": str(repository)},
+                        clear=False,
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError,
+                            r"invalid CortexOps checkout from "
+                            rf"CORTEXOPS_REPOSITORY:.*{detail}",
+                        ):
+                            configure_cortexops_workspace()
+
     def test_local_jsonl_bridge_writes_sdk_compatible_documents(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "events.jsonl"
@@ -470,10 +499,6 @@ class CortexOpsBridgeTest(unittest.IsolatedAsyncioTestCase):
                 exporter.export({"event_type": "custom.event"})
 
     @pytest.mark.cortexops_integration
-    @pytest.mark.skipif(
-        not cortexops_workspace_available(),
-        reason="real CortexOps checkout unavailable",
-    )
     def test_real_sibling_sdk_and_parser_accept_factory_jsonl(self) -> None:
         configure_cortexops_workspace()
         parser_module = import_module("cortexops.adapters.cortexops_sdk.parser")
@@ -501,10 +526,6 @@ class CortexOpsBridgeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(parsed.events), 1)
 
     @pytest.mark.cortexops_integration
-    @pytest.mark.skipif(
-        not cortexops_workspace_available(),
-        reason="real CortexOps checkout unavailable",
-    )
     def test_explicit_otlp_uses_real_sdk_exporter_without_network(self) -> None:
         configure_cortexops_workspace()
         exporter_module = import_module("cortexops_sdk.exporter")
