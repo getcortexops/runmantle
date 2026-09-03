@@ -73,7 +73,7 @@ durable boundary:
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install runmantle==1.0.1
+python -m pip install runmantle==1.0.2
 mkdir release-guard && cd release-guard
 runmantle init .
 runmantle doctor

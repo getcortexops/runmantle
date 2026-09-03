@@ -57,7 +57,10 @@ CORTEXOPS_REPOSITORY=../cortexops pytest -q
 ```
 
 CI uses a separate combined-workspace job to check out and install CortexOps.
-Its absence never prevents collection of the standalone suite.
+Its absence never prevents collection of the standalone suite. The private
+cross-repository checkout uses the `CORTEXOPS_REPOSITORY_TOKEN` repository
+secret, whose token must have read-only Contents access to
+`getcortexops/CortexOps`.
 
 Run the packaged demo after installation:
 
