@@ -7,6 +7,7 @@ persisted Hermes gate request to an exact CortexOps approval and dispatch permit
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import shutil
 import sqlite3
@@ -29,6 +30,13 @@ from runmantle.integrations.cortexops_control import (
     _digest,
 )
 from runmantle.telemetry import task_contract_telemetry
+from runmantle.tool_discovery import (
+    DiscoveredTool,
+    ToolClassifier,
+    ToolDescriptor,
+    ToolDiscoveryError,
+    ToolInventory,
+)
 from runmantle.verification import FieldEqualsCriterion
 
 
@@ -85,7 +93,7 @@ def hermes_task_contract(
 ) -> TaskContract[dict[str, str], dict[str, bool]]:
     """Build the immutable task contract shared by the plugin and verifier."""
 
-    evidence_type = "hermes_deployment_runtime"
+    evidence_type = "hermes_tool_runtime"
     criteria: list[Any] = [
         FieldEqualsCriterion(
             name="hermes_execution_reported",
@@ -106,7 +114,7 @@ def hermes_task_contract(
     )
     return TaskContract(
         task_id=task_id,
-        objective="Verify one CortexOps-governed Hermes deployment action.",
+        objective="Verify one CortexOps-governed Hermes tool action.",
         input={"session_id": session_id},
         acceptance_criteria=tuple(criteria),
         required_evidence=(
@@ -129,14 +137,15 @@ class HermesControlConfig:
     cortexops_url: str
     authorization: str | None
     runtime_id: str
-    controlled_tools: Mapping[str, Mapping[str, Any]]
     state_path: Path
+    controlled_tools: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     post_action_probes: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     decision_timeout_seconds: float = 5
     approval_timeout_seconds: float = 300
     approval_poll_initial_seconds: float = 0.25
     approval_poll_max_seconds: float = 2
     blocking_hook_approval: bool = False
+    govern_read_only_tools: bool = False
     redact_keys: frozenset[str] = frozenset(
         {"authorization", "token", "secret", "password", "api_key"}
     )
@@ -144,14 +153,23 @@ class HermesControlConfig:
     @classmethod
     def from_settings(cls, settings: Mapping[str, Any]) -> HermesControlConfig:
         url = str(settings.get("cortexops_url") or "").rstrip("/")
-        tools, probes = (
-            settings.get("controlled_tools"),
-            settings.get("post_action_probes"),
-        )
+        legacy_tools = settings.get("controlled_tools")
+        configured_overrides = settings.get("classification_overrides")
+        probes = settings.get("post_action_probes")
         if not url:
             raise ValueError("cortexops_url is required")
-        if not isinstance(tools, Mapping) or not tools:
-            raise ValueError("controlled_tools must explicitly name at least one tool")
+        overrides: dict[str, Mapping[str, Any]] = {}
+        for configured in (legacy_tools, configured_overrides):
+            if configured is None:
+                continue
+            if not isinstance(configured, Mapping):
+                raise ValueError("tool classification overrides must be a mapping")
+            for name, value in configured.items():
+                if not isinstance(value, Mapping):
+                    raise ValueError(
+                        f"classification override for {name!r} must be a mapping"
+                    )
+                overrides[str(name)] = dict(value)
         initial, maximum = (
             float(settings.get("approval_poll_initial_seconds") or 0.25),
             float(settings.get("approval_poll_max_seconds") or 2),
@@ -159,24 +177,83 @@ class HermesControlConfig:
         if initial <= 0 or maximum < initial:
             raise ValueError("approval polling intervals must be positive and ordered")
         return cls(
-            url,
-            settings.get("authorization"),
-            str(settings.get("runtime_id") or "hermes"),
-            tools,
-            Path(
+            cortexops_url=url,
+            authorization=settings.get("authorization"),
+            runtime_id=str(settings.get("runtime_id") or "hermes"),
+            state_path=Path(
                 str(
                     settings.get("state_path") or "~/.hermes/runmantle-cortexops.sqlite"
                 )
             ).expanduser(),
-            probes if isinstance(probes, Mapping) else {},
-            float(settings.get("decision_timeout_seconds") or 5),
-            float(settings.get("approval_timeout_seconds") or 300),
-            initial,
-            maximum,
-            settings.get("blocking_hook_approval") is True,
-            frozenset(str(v).lower() for v in (settings.get("redact_keys") or []))
-            or cls.redact_keys,
+            controlled_tools=overrides,
+            post_action_probes=probes if isinstance(probes, Mapping) else {},
+            decision_timeout_seconds=float(
+                settings.get("decision_timeout_seconds") or 5
+            ),
+            approval_timeout_seconds=float(
+                settings.get("approval_timeout_seconds") or 300
+            ),
+            approval_poll_initial_seconds=initial,
+            approval_poll_max_seconds=maximum,
+            blocking_hook_approval=settings.get("blocking_hook_approval") is True,
+            govern_read_only_tools=settings.get("govern_read_only_tools") is True,
+            redact_keys=(
+                frozenset(
+                    str(v).lower() for v in (settings.get("redact_keys") or [])
+                )
+                or cls.redact_keys
+            ),
         )
+
+
+class HermesToolDiscoveryAdapter:
+    """Read registered tools from Hermes's live, profile-scoped registry."""
+
+    def __init__(self, registry: Any | None = None) -> None:
+        self._registry = registry
+
+    def _active_registry(self) -> Any:
+        if self._registry is not None:
+            return self._registry
+        try:
+            return importlib.import_module("tools.registry").registry
+        except (AttributeError, ImportError) as error:
+            raise ToolDiscoveryError("Hermes tool registry is unavailable") from error
+
+    def discover_tools(self) -> tuple[DiscoveredTool, ...]:
+        registry = self._active_registry()
+        try:
+            entries = tuple(registry.get_all_entries())
+        except Exception as error:
+            raise ToolDiscoveryError("Hermes tool registry discovery failed") from error
+
+        tools: list[DiscoveredTool] = []
+        for entry in entries:
+            schema = entry.schema if isinstance(entry.schema, Mapping) else {}
+            handler_module = str(getattr(entry.handler, "__module__", "") or "")
+            provider = (
+                handler_module.split(".", 2)[1]
+                if handler_module.startswith("hermes_plugins.")
+                else "hermes"
+            )
+            description = str(
+                getattr(entry, "description", "") or schema.get("description") or ""
+            )
+            tools.append(
+                DiscoveredTool(
+                    name=str(entry.name),
+                    provider=provider,
+                    framework="hermes",
+                    discovery_source="hermes.tool_registry",
+                    description=description,
+                    input_schema=schema,
+                    metadata={
+                        "toolset": str(getattr(entry, "toolset", "") or ""),
+                        "handler_module": handler_module,
+                    },
+                )
+            )
+        return tuple(tools)
 
 
 class HermesControlAdapter:
@@ -184,7 +261,11 @@ class HermesControlAdapter:
 
     _RULE_PREFIX = "plugin_rule:cortexops:"
 
-    def __init__(self, config: HermesControlConfig) -> None:
+    def __init__(
+        self,
+        config: HermesControlConfig,
+        tool_discovery: HermesToolDiscoveryAdapter | None = None,
+    ) -> None:
         self.config = config
         self.client = CortexOpsControlClient(
             UrllibCortexOpsControlTransport(
@@ -196,6 +277,9 @@ class HermesControlAdapter:
             "hermes-plugin-v1",
         )
         self._lock = threading.RLock()
+        self._tool_discovery = tool_discovery or HermesToolDiscoveryAdapter()
+        self.tool_inventory = ToolInventory(ToolClassifier(config.controlled_tools))
+        self._refresh_tools()
         config.state_path.parent.mkdir(parents=True, exist_ok=True)
         with self._db() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS hermes_actions (
@@ -213,9 +297,25 @@ class HermesControlAdapter:
         db.row_factory = sqlite3.Row
         return db
 
-    def _tool(self, name: str) -> Mapping[str, Any] | None:
-        value = self.config.controlled_tools.get(name)
-        return value if isinstance(value, Mapping) else None
+    def _refresh_tools(self) -> bool:
+        try:
+            self.tool_inventory.refresh(self._tool_discovery)
+            return True
+        except ToolDiscoveryError:
+            # Invocation remains fail-closed through classify_unknown().
+            return False
+
+    def _tool(self, name: str) -> ToolDescriptor:
+        if self._refresh_tools():
+            descriptor = self.tool_inventory.get(name)
+            if descriptor is not None:
+                return descriptor
+        return self.tool_inventory.classify_unknown(
+            name,
+            provider="hermes",
+            framework="hermes",
+            discovery_source="hermes.pre_tool_call",
+        )
 
     @staticmethod
     def _approval_rule(call_id: str) -> str:
@@ -255,8 +355,19 @@ class HermesControlAdapter:
 
     def pre_tool_call(self, **kw: Any) -> dict[str, str] | None:
         tool_name = str(kw.get("tool_name") or "")
-        tool = self._tool(tool_name)
-        if tool is None:
+        if not tool_name:
+            return {
+                "action": "block",
+                "message": "BLOCKED: missing Hermes tool identity",
+            }
+        try:
+            tool = self._tool(tool_name)
+        except (ToolDiscoveryError, TypeError, ValueError):
+            return {
+                "action": "block",
+                "message": "BLOCKED: tool classification unavailable",
+            }
+        if tool.read_only and not self.config.govern_read_only_tools:
             return None
         raw_args = kw.get("args")
         args: Mapping[str, Any] = raw_args if isinstance(raw_args, Mapping) else {}
@@ -303,11 +414,14 @@ class HermesControlAdapter:
         request = ActionRequest(
             action_id=action_id,
             task_id=task_id,
-            name=str(tool.get("action_name") or tool_name),
-            required_capability=str(tool.get("capability") or "terminal.deploy"),
+            name=str(
+                self.config.controlled_tools.get(tool_name, {}).get("action_name")
+                or tool_name
+            ),
+            required_capability=tool.capability,
             input=redact(args, self.config.redact_keys),
             idempotency_key=action_id,
-            risk_level=RiskLevel(str(tool.get("risk_level") or "high")),
+            risk_level=tool.risk_level,
             requested_by="hermes",
             requested_at=datetime.now(UTC),
             timeout=timedelta(seconds=self.config.decision_timeout_seconds),
@@ -315,6 +429,7 @@ class HermesControlAdapter:
                 "session_id": session_id,
                 "tool_call_id": call_id,
                 "args_hash": args_hash,
+                "tool_descriptor": tool.as_dict(),
             },
         )
         probe = self.config.post_action_probes.get(tool_name)
@@ -333,10 +448,11 @@ class HermesControlAdapter:
         try:
             if not getattr(self.client, "_handshake", None):
                 capabilities = {
-                    str(spec.get("capability") or "terminal.deploy")
-                    for spec in self.config.controlled_tools.values()
-                    if isinstance(spec, Mapping)
+                    descriptor.capability
+                    for descriptor in self.tool_inventory.snapshot()
+                    if descriptor.side_effecting
                 }
+                capabilities.add(tool.capability)
                 capabilities.update({"govern.v2", "govern.receipt.v1"})
                 self.client.register_runtime(capabilities)
             self._register_task(contract, session_id)
@@ -362,7 +478,13 @@ class HermesControlAdapter:
                         request.action_hash,
                         decision_id,
                         _canonical(decision),
-                        _canonical({"action_id": action_id, "args_hash": args_hash}),
+                        _canonical(
+                            {
+                                "action_id": action_id,
+                                "args_hash": args_hash,
+                                "tool_descriptor": tool.as_dict(),
+                            }
+                        ),
                         state,
                     ),
                 )
@@ -445,6 +567,7 @@ class HermesControlAdapter:
             TypeError,
             ValueError,
             OSError,
+            sqlite3.Error,
         ):
             return {
                 "action": "block",
@@ -687,6 +810,7 @@ def register(ctx: Any) -> None:
         "authorization",
         "runtime_id",
         "controlled_tools",
+        "classification_overrides",
         "post_action_probes",
         "state_path",
         "decision_timeout_seconds",
@@ -694,6 +818,7 @@ def register(ctx: Any) -> None:
         "approval_poll_initial_seconds",
         "approval_poll_max_seconds",
         "blocking_hook_approval",
+        "govern_read_only_tools",
         "redact_keys",
     )
     adapter = HermesControlAdapter(
@@ -734,6 +859,7 @@ def main() -> int:
 __all__ = [
     "HermesControlAdapter",
     "HermesControlConfig",
+    "HermesToolDiscoveryAdapter",
     "hermes_task_contract",
     "install_plugin",
     "main",

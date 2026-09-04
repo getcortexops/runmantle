@@ -4,8 +4,14 @@ Install RunMantle, then run `runmantle-hermes-control-install` and enable it wit
 `hermes plugins enable runmantle-cortexops-control`. Select the presentation
 transport with `security.approval.transport: cortexops`.
 
-The plugin controls only `plugins.entries.runmantle-cortexops-control.settings.controlled_tools`.
-It never treats a Hermes terminal result as runtime confirmation. CortexOps must approve
+The plugin discovers tools from Hermes's live central tool registry. RunMantle classifies
+the exposed name, toolset, schema, and description into a normalized capability and risk.
+Known read-only tools remain observable-only by default. Every side-effecting tool and
+every unknown or insufficiently classified tool is sent through CortexOps governance.
+This applies to built-in, plugin-provided, and dynamically registered tools, so adding an
+alternate tool does not create an allowlist bypass.
+
+It never treats a Hermes tool result as runtime confirmation. CortexOps must approve
 `REQUIRE_APPROVAL` decisions through its authenticated approval API; unavailable, stale,
 malformed, denied, or timed-out responses block execution.
 
@@ -22,19 +28,26 @@ plugins:
         approval_timeout_seconds: 300
         approval_poll_initial_seconds: 0.25
         approval_poll_max_seconds: 2
-        controlled_tools:
+        # Optional overrides; discovery does not require a tool list.
+        classification_overrides:
           terminal:
             action_name: local-deployment
             capability: terminal.deploy
             risk_level: high
+            side_effecting: true
 security:
   approval:
     transport: cortexops
 ```
 
-`cortexops_url` is the CortexOps origin (as above). The transport creates a CortexOps pending approval
-for every `REQUIRE_APPROVAL`; it polls that authoritative record and returns
-only Hermes's `once` response. It never returns `session` or `always`.
+`classification_overrides` is optional and is applied after automatic classification.
+The former `controlled_tools` setting is accepted as a backward-compatible override map,
+not as the scope of governed tools. Set `govern_read_only_tools: true` to route reads
+through policy as well.
+
+`cortexops_url` is the CortexOps origin (as above). The transport creates a CortexOps
+pending approval for every `REQUIRE_APPROVAL`; it polls that authoritative record and
+returns only Hermes's `once` response. It never returns `session` or `always`.
 
 For a local end-to-end run, install both checked-out projects, configure a
 runtime bearer token and an operator bearer token in CortexOps, start its

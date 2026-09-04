@@ -1,6 +1,6 @@
 name: runmantle-cortexops-control
-version: 0.1.0
-description: Fail-closed CortexOps governance for explicitly configured Hermes tools.
+version: 0.2.0
+description: Automatic fail-closed CortexOps governance for Hermes tools.
 author: CortexOps
 provides_hooks: [pre_tool_call, post_tool_call]
 python_dependencies: [runmantle]

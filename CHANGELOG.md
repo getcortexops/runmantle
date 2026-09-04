@@ -2,10 +2,25 @@
 
 All notable changes to Runmantle are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html) while remaining in
-the `0.x` development series.
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [1.1.0] - 2026-09-04
+
+### Added
+
+- framework-neutral tool descriptors, discovery adapter protocol, conservative
+  semantic capability/risk classification, and explicit classification overrides;
+- live Hermes registry discovery that automatically governs every side-effecting
+  or insufficiently classified tool while leaving known reads observable-only;
+
+### Changed
+
+- Hermes `controlled_tools` is now a backward-compatible override map rather
+  than a manually maintained governance allowlist.
+
+## [1.0.0] - 2026-08-31
 
 ### Added
 

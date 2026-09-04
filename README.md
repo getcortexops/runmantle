@@ -73,7 +73,7 @@ durable boundary:
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install runmantle==1.0.2
+python -m pip install runmantle==1.1.0
 mkdir release-guard && cd release-guard
 runmantle init .
 runmantle doctor
@@ -178,6 +178,11 @@ Runmantle cannot prevent arbitrary side effects performed directly by
 unrestricted Python code. Keep consequential clients and credentials behind
 the mediated tool boundary for these controls to apply. See
 [mediated actions and the capability matrix](docs/actions.md).
+
+The Hermes control plugin discovers its live tool registry automatically,
+normalizes tool capability and risk, and routes all side-effecting or unknown
+tools through governance. Manual tool enumeration is not required; optional
+classification overrides remain available for application-specific semantics.
 
 ## Evidence limitations
 

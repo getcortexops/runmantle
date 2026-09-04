@@ -170,6 +170,14 @@ from .telemetry import (
     TaskEventEmitter,
     lifecycle_event_to_dict,
 )
+from .tool_discovery import (
+    DiscoveredTool,
+    ToolClassifier,
+    ToolDescriptor,
+    ToolDiscoveryAdapter,
+    ToolDiscoveryError,
+    ToolInventory,
+)
 from .verification import (
     ApprovalCriterion,
     CollectionNotEmptyCriterion,
@@ -237,6 +245,7 @@ __all__ = [
     "DemoRun",
     "DependencyKey",
     "DependencyResolver",
+    "DiscoveredTool",
     "DurableRecoveryExecutor",
     "DurableRecoveryHandler",
     "DurableRuntime",
@@ -333,6 +342,11 @@ __all__ = [
     "TaskResult",
     "TaskStatus",
     "TaskTimestamps",
+    "ToolClassifier",
+    "ToolDescriptor",
+    "ToolDiscoveryAdapter",
+    "ToolDiscoveryError",
+    "ToolInventory",
     "VerificationReport",
     "VerificationResult",
     "VerificationStatus",
@@ -351,4 +365,4 @@ __all__ = [
     "standard_recovery_capabilities",
 ]
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
