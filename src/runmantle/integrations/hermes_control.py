@@ -198,9 +198,7 @@ class HermesControlConfig:
             blocking_hook_approval=settings.get("blocking_hook_approval") is True,
             govern_read_only_tools=settings.get("govern_read_only_tools") is True,
             redact_keys=(
-                frozenset(
-                    str(v).lower() for v in (settings.get("redact_keys") or [])
-                )
+                frozenset(str(v).lower() for v in (settings.get("redact_keys") or []))
                 or cls.redact_keys
             ),
         )

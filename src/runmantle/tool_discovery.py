@@ -255,9 +255,7 @@ class ToolClassifier:
                 (
                     rule
                     for rule in _RULES
-                    if any(
-                        re.search(pattern, searchable) for pattern in rule.patterns
-                    )
+                    if any(re.search(pattern, searchable) for pattern in rule.patterns)
                 ),
                 None,
             )
