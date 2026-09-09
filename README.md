@@ -24,6 +24,9 @@ scheduling, and workforce coordination belong to CortexOps, not Runmantle.
 - evidence collection and deterministic rule-based outcome verification;
 - capability-mediated action execution with durable policy, authorization,
   idempotency, receipts, and postcondition evidence;
+- a minimal verified action cache for exact-first recipe reuse with fresh state
+  validation, repeat verification, token-savings metrics, and no approval or
+  policy bypass;
 - calculated evidence checksums, acquisition methods, trust levels, freshness
   requirements, and immutable persisted evidence;
 - durable, approval-bound, idempotent recovery with explicit preflight,
