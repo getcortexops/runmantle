@@ -411,4 +411,4 @@ __all__ = [
     "standard_recovery_capabilities",
 ]
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"

@@ -6,6 +6,15 @@ All notable changes to Runmantle are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-09-09
+
+### Added
+
+- minimal, framework-neutral verified action cache with exact-first matching,
+  fresh-state validation, repeat verification, and avoided-token metrics;
+- a governed file-write reuse demo that validates current file hashes before
+  reuse and verifies the resulting content after every execution.
+
 ## [1.1.0] - 2026-09-04
 
 ### Added

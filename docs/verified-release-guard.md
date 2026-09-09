@@ -20,7 +20,7 @@ env -u OPENAI_API_KEY python -m examples.verified_release_guard.openai_offline
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install runmantle==1.1.0
+python -m pip install runmantle==1.1.1
 mkdir release-guard && cd release-guard
 runmantle init .
 runmantle doctor
