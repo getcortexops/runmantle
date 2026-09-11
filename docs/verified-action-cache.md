@@ -38,3 +38,18 @@ wording task may reuse the recipe only if the current file is still at one of
 those safe states; an unrelated intervening edit invalidates the recipe and
 uses normal discovery again. The result's file hash is observed and checked
 after every write.
+
+## Hermes integration
+
+The CortexOps Hermes control plugin uses this cache on the real Hermes turn
+path. It looks up a verified strategy before LLM planning, validates current
+tool, capability, argument, and probe identities at `pre_tool_call`, and then
+continues through the normal policy, approval, dispatch, receipt, runtime-
+confirmation, and verification sequence. It stores no recipe for failed,
+unconfirmed, inconclusive, or unmeasured runs.
+
+Hermes's normalized `post_api_request` usage is the only token source. The
+plugin aggregates the provider-reported input and output tokens for the turn
+and reports a measured baseline and measured reuse to CortexOps. It never
+derives token savings from prompt length or substitutes an estimate when
+Hermes did not report usage.

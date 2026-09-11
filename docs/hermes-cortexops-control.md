@@ -28,6 +28,10 @@ plugins:
         approval_timeout_seconds: 300
         approval_poll_initial_seconds: 0.25
         approval_poll_max_seconds: 2
+        # Enabled by default. Only successful runs verified by the configured
+        # post-action probes become reusable measured baselines.
+        verified_action_cache_enabled: true
+        verified_action_cache_similarity_threshold: 0.8
         # Required: do not poll CortexOps from Hermes's short-lived hook.
         blocking_hook_approval: false
         # Optional overrides; discovery does not require a tool list.
@@ -46,6 +50,24 @@ security:
 The former `controlled_tools` setting is accepted as a backward-compatible override map,
 not as the scope of governed tools. Set `govern_read_only_tools: true` to route reads
 through policy as well.
+
+The plugin also wires RunMantle's Verified Action Cache into Hermes's turn and
+tool hooks. `pre_llm_call` performs exact-first recipe lookup and supplies only
+the verified tool/capability strategy to Hermes. `pre_tool_call` freshly checks
+the discovered tool descriptor, capability, argument hash, and configured
+runtime probe before the usual CortexOps policy and approval flow. Recipe reuse
+therefore does not replay a permit or dispatch a tool directly.
+
+After execution, the normal receipt is delivered first and the configured
+`post_action_probes` are evaluated by RunMantle's rule verifier. Only a
+successful, runtime-confirmed, verified task can create a recipe. Provider-
+reported usage from Hermes's `post_api_request` hook is summed across the turn;
+when it is unavailable, the plugin neither invents a measurement nor creates a
+measured recipe baseline. `post_llm_call` sends the resulting miss/baseline or
+hit/reuse observation to CortexOps's
+`/api/runmantle/v1/verified-action-cache/telemetry` endpoint. Recipes persist in
+the plugin's SQLite `state_path`, while approvals, receipts, confirmation, and
+verification are performed anew after a restart.
 
 `cortexops_url` is the CortexOps origin (as above). The transport creates a CortexOps
 pending approval for every `REQUIRE_APPROVAL`; it polls that authoritative record and

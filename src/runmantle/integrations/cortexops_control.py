@@ -226,6 +226,25 @@ class CortexOpsControlClient:
             )
         return self._request("POST", "/tasks/status", payload)
 
+    def record_verified_action_cache_telemetry(
+        self,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Record one measured verified-recipe cache observation.
+
+        CortexOps remains authoritative about whether the referenced task,
+        decision, receipt, and source recipe form a valid evidence chain.
+        """
+
+        material = dict(payload)
+        if material.get("runtime_id") != self.runtime_id:
+            raise ValueError("cache telemetry runtime_id does not match the client")
+        return self._request(
+            "POST",
+            "/verified-action-cache/telemetry",
+            material,
+        )
+
     def evaluate_action(
         self,
         request: ActionRequest,

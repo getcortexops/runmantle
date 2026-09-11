@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import os
 import pty
@@ -395,9 +394,10 @@ plugins:
         approval_timeout_seconds: 60
         approval_poll_initial_seconds: 0.05
         approval_poll_max_seconds: 0.25
-        # Hermes owns the user-facing approval wait. The RunMantle pre-tool
-        # hook must return immediately with the approval directive.
-        blocking_hook_approval: false
+        # The isolated driver resolves CortexOps from a second process while
+        # this hook waits. Production profiles should use the native approval
+        # transport documented in docs/hermes-cortexops-control.md instead.
+        blocking_hook_approval: true
         classification_overrides:
           terminal:
             action_name: local-deployment
@@ -458,35 +458,13 @@ def _wait_for_model_tool_result(
     raise TimeoutError("Hermes did not consume the tool result")
 
 
-async def _verify_approved_outcome(
+def _verify_approved_outcome(
     scenario_dir: Path,
     *,
     adapter_db: Path,
-    cortexops_url: str,
     deployment_url: str,
     runtime_id: str,
 ) -> dict[str, Any]:
-    from runmantle import (
-        CapabilityDeclaration,
-        DurableRuntime,
-        EvidenceAcquisitionMethod,
-        EvidenceItem,
-        EvidenceTrustLevel,
-        FunctionWorker,
-        JsonlEventSink,
-        RiskLevel,
-        RuleBasedVerifier,
-        TaskContext,
-        TaskStatus,
-        WorkerReport,
-    )
-    from runmantle.evidence import _establish_evidence_origin
-    from runmantle.integrations.cortexops_control import (
-        CortexOpsControlClient,
-        UrllibCortexOpsControlTransport,
-    )
-    from runmantle.integrations.hermes_control import hermes_task_contract
-
     action = _rows(adapter_db, "SELECT * FROM hermes_actions")[0]
     remote_task = _rows(
         scenario_dir / "cortexops.db",
@@ -495,87 +473,28 @@ async def _verify_approved_outcome(
     )[0]
     task_id = str(remote_task["task_id"])
     session_id = str(remote_task["correlation_id"])
-    expected = {
-        "version": {"version": "v2"},
-        "health": {"status": "healthy"},
-    }
-    contract = hermes_task_contract(
-        task_id,
-        session_id,
-        capability="terminal.deploy",
-        risk_level=RiskLevel.HIGH,
-        expected_state=expected,
-    )
-
-    async def report(
-        _contract: Any, _context: TaskContext
-    ) -> WorkerReport[dict[str, bool]]:
-        return WorkerReport.completed({"executed": True})
-
-    worker = FunctionWorker(
-        id="hermes",
-        name="Hermes CLI",
-        role="governed deployment agent",
-        version="local-demo",
-        capabilities=(
-            CapabilityDeclaration(
-                name="terminal.deploy",
-                description="Deploy the isolated local version service.",
-            ),
-        ),
-        handler=report,
-    )
-    events_path = scenario_dir / "runmantle-events.jsonl"
-    runtime = DurableRuntime(
-        database_path=scenario_dir / "runmantle-runtime.db",
-        verifier=RuleBasedVerifier(),
-        event_sink=JsonlEventSink(events_path),
-    )
-    awaiting = await runtime.execute(worker, contract, correlation_id=session_id)
-    if awaiting.status is not TaskStatus.AWAITING_EVIDENCE:
-        raise AssertionError(f"expected AWAITING_EVIDENCE, got {awaiting.status}")
     observed = {
         "version": _get_json(f"{deployment_url}/version"),
         "health": _get_json(f"{deployment_url}/health"),
     }
-    evidence = _establish_evidence_origin(
-        EvidenceItem(
-            evidence_id=f"runtime-probe:{action['tool_call_id']}",
-            type="hermes_deployment_runtime",
-            source=deployment_url,
-            collected_at=datetime.now(UTC),
-            payload=observed,
-        ),
-        boundary="hermes_cortexops_local_demo_http_probe",
-        provider_identity="scripts.hermes_cortexops_demo:http-probe:v1",
-        provider_configuration={"version_url": "/version", "health_url": "/health"},
-        trust_level=EvidenceTrustLevel.RUNTIME_OBSERVED,
-        acquisition_method=EvidenceAcquisitionMethod.RUNTIME_OBSERVED,
-    )
-    runtime.store.record_evidence(task_id, evidence)
-    verified = await runtime.resume(task_id, contract=contract)
-    if verified.status is not TaskStatus.VERIFIED:
-        raise AssertionError(f"RunMantle did not verify the outcome: {verified.status}")
-
-    control = CortexOpsControlClient(
-        UrllibCortexOpsControlTransport(
-            cortexops_url,
-            authorization_provider=lambda: f"Bearer {RUNTIME_TOKEN}",
-        ),
-        runtime_id=runtime_id,
-        runtime_version="hermes-plugin-v1",
-    )
-    control.register_runtime({"terminal.deploy", "govern.v2", "govern.receipt.v1"})
-    synchronized = control.sync_task_result(contract, verified, sequence=1)
-    if synchronized.get("verified_status") != "verified":
-        raise AssertionError(f"CortexOps did not retain VERIFIED: {synchronized}")
+    expected = {
+        "version": {"version": "v2"},
+        "health": {"status": "healthy"},
+    }
+    if observed != expected:
+        raise AssertionError(f"RunMantle runtime probe did not verify: {observed}")
+    if action.get("verification_status") != "verified":
+        raise AssertionError(f"Hermes plugin did not verify the action: {action}")
+    if remote_task.get("verified_status") != "verified":
+        raise AssertionError(f"CortexOps did not retain VERIFIED: {remote_task}")
+    evidence = json.loads(str(action["evidence_json"]))
     return {
         "task_id": task_id,
         "session_id": session_id,
-        "evidence_id": evidence.evidence_id,
-        "evidence_checksum": evidence.checksum,
-        "verification_status": verified.status.value,
-        "verification_hash": synchronized.get("verification_hash"),
+        "evidence_id": evidence["evidence_id"],
+        "evidence_checksum": evidence["checksum"],
+        "verification_status": action["verification_status"],
+        "verification_hash": action["verification_hash"],
         "observed": observed,
     }
 
@@ -833,14 +752,11 @@ def _scenario(
         if scenario == "approve":
             if state["version"] != "v2" or state["execution_count"] != 1:
                 raise AssertionError(f"approve did not execute exactly once: {state}")
-            verification = asyncio.run(
-                _verify_approved_outcome(
-                    scenario_dir,
-                    adapter_db=adapter_db,
-                    cortexops_url=f"http://127.0.0.1:{ports['cortexops']}",
-                    deployment_url=f"http://127.0.0.1:{ports['deployment']}",
-                    runtime_id=runtime_id,
-                )
+            verification = _verify_approved_outcome(
+                scenario_dir,
+                adapter_db=adapter_db,
+                deployment_url=f"http://127.0.0.1:{ports['deployment']}",
+                runtime_id=runtime_id,
             )
         else:
             if state["version"] != "v1" or state["execution_count"] != 0:

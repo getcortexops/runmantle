@@ -13,7 +13,7 @@ import shutil
 import sqlite3
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,7 +22,14 @@ from urllib.request import Request, urlopen
 
 from runmantle.actions import ActionRequest
 from runmantle.contracts import RiskLevel, TaskContract
-from runmantle.evidence import EvidenceRequirement
+from runmantle.evidence import (
+    EvidenceAcquisitionMethod,
+    EvidenceCollection,
+    EvidenceItem,
+    EvidenceRequirement,
+    EvidenceTrustLevel,
+    _establish_evidence_origin,
+)
 from runmantle.integrations.cortexops_control import (
     CortexOpsControlClient,
     CortexOpsControlError,
@@ -37,7 +44,21 @@ from runmantle.tool_discovery import (
     ToolDiscoveryError,
     ToolInventory,
 )
-from runmantle.verification import FieldEqualsCriterion
+from runmantle.verification import (
+    FieldEqualsCriterion,
+    RuleBasedVerifier,
+    VerificationResult,
+    VerificationStatus,
+)
+from runmantle.verified_action_cache import (
+    CacheMatch,
+    PreconditionResult,
+    RecipeStep,
+    ReuseRequest,
+    VerificationEvidence,
+    VerifiedActionCache,
+    VerifiedActionRecipe,
+)
 
 
 def _canonical(value: Mapping[str, Any]) -> str:
@@ -52,6 +73,16 @@ def _same_hash(left: Any, right: Any) -> bool:
     return str(left).lower().removeprefix("sha256:") == str(right).lower().removeprefix(
         "sha256:"
     )
+
+
+def _plain(value: Any) -> Any:
+    """Return JSON-compatible recipe data without retaining live objects."""
+
+    if isinstance(value, Mapping):
+        return {str(key): _plain(item) for key, item in value.items()}
+    if isinstance(value, tuple | list):
+        return [_plain(item) for item in value]
+    return value
 
 
 def redact(value: Any, keys: frozenset[str]) -> Any:
@@ -146,6 +177,8 @@ class HermesControlConfig:
     approval_poll_max_seconds: float = 2
     blocking_hook_approval: bool = False
     govern_read_only_tools: bool = False
+    verified_action_cache_enabled: bool = True
+    verified_action_cache_similarity_threshold: float = 0.8
     redact_keys: frozenset[str] = frozenset(
         {"authorization", "token", "secret", "password", "api_key"}
     )
@@ -176,6 +209,18 @@ class HermesControlConfig:
         )
         if initial <= 0 or maximum < initial:
             raise ValueError("approval polling intervals must be positive and ordered")
+        configured_cache_threshold = settings.get(
+            "verified_action_cache_similarity_threshold"
+        )
+        cache_threshold = (
+            0.8
+            if configured_cache_threshold is None
+            else float(configured_cache_threshold)
+        )
+        if not 0 <= cache_threshold <= 1:
+            raise ValueError(
+                "verified action cache similarity threshold must be between 0 and 1"
+            )
         return cls(
             cortexops_url=url,
             authorization=settings.get("authorization"),
@@ -197,10 +242,74 @@ class HermesControlConfig:
             approval_poll_max_seconds=maximum,
             blocking_hook_approval=settings.get("blocking_hook_approval") is True,
             govern_read_only_tools=settings.get("govern_read_only_tools") is True,
+            verified_action_cache_enabled=(
+                settings.get("verified_action_cache_enabled") is not False
+            ),
+            verified_action_cache_similarity_threshold=cache_threshold,
             redact_keys=(
                 frozenset(str(v).lower() for v in (settings.get("redact_keys") or []))
                 or cls.redact_keys
             ),
+        )
+
+
+@dataclass(frozen=True)
+class _HermesProbeVerification:
+    result: VerificationResult
+    evidence: EvidenceItem
+    contract: TaskContract[dict[str, str], dict[str, bool]]
+
+
+@dataclass(frozen=True)
+class _HermesRecipePreconditionValidator:
+    """Validate current Hermes call facts before treating a recipe as reused."""
+
+    tool: ToolDescriptor
+    args_hash: str
+    probe_hash: str
+
+    def validate(
+        self, recipe: VerifiedActionRecipe, request: ReuseRequest
+    ) -> Sequence[PreconditionResult]:
+        del request
+        expected = recipe.preconditions
+        checks = (
+            (
+                "tool",
+                expected.get("tool") == self.tool.name,
+                "the currently selected Hermes tool matches the recipe",
+            ),
+            (
+                "capability",
+                expected.get("capability") == self.tool.capability,
+                "the freshly classified capability matches the recipe",
+            ),
+            (
+                "tool_descriptor",
+                expected.get("tool_descriptor_hash")
+                == _hash({"descriptor": self.tool.as_dict()}),
+                "the freshly discovered tool descriptor matches the recipe",
+            ),
+            (
+                "arguments",
+                expected.get("args_hash") == self.args_hash,
+                "the current redacted argument identity matches the recipe",
+            ),
+            (
+                "verification_probe",
+                expected.get("probe_hash") == self.probe_hash,
+                "the current runtime verification probe matches the recipe",
+            ),
+        )
+        return tuple(
+            PreconditionResult(
+                name=name,
+                passed=passed,
+                message=message
+                if passed
+                else message.replace("matches", "changed from"),
+            )
+            for name, passed, message in checks
         )
 
 
@@ -275,6 +384,9 @@ class HermesControlAdapter:
             "hermes-plugin-v1",
         )
         self._lock = threading.RLock()
+        self._cache = VerifiedActionCache(
+            similarity_threshold=config.verified_action_cache_similarity_threshold
+        )
         self._tool_discovery = tool_discovery or HermesToolDiscoveryAdapter()
         self.tool_inventory = ToolInventory(ToolClassifier(config.controlled_tools))
         self._refresh_tools()
@@ -289,11 +401,556 @@ class HermesControlAdapter:
                 state TEXT NOT NULL DEFAULT 'evaluated', dispatch_attempt_id TEXT,
                 receipt_json TEXT, receipt_delivered INTEGER NOT NULL DEFAULT 0,
                 confirmation_delivered INTEGER NOT NULL DEFAULT 0)""")
+            existing_columns = {
+                str(row[1])
+                for row in db.execute("PRAGMA table_info(hermes_actions)").fetchall()
+            }
+            for column, declaration in (
+                ("run_id", "TEXT"),
+                ("cache_status", "TEXT"),
+                ("recipe_id", "TEXT"),
+                ("match_type", "TEXT"),
+                ("match_confidence", "REAL"),
+                ("validation_json", "TEXT"),
+                ("verification_status", "TEXT"),
+                ("verification_hash", "TEXT"),
+                ("evidence_json", "TEXT"),
+            ):
+                if column not in existing_columns:
+                    db.execute(
+                        f"ALTER TABLE hermes_actions ADD COLUMN {column} {declaration}"
+                    )
+            db.execute("""CREATE TABLE IF NOT EXISTS hermes_cache_runs (
+                run_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                task_intent TEXT NOT NULL,
+                candidate_recipe_id TEXT,
+                match_type TEXT,
+                match_confidence REAL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                usage_observed INTEGER NOT NULL DEFAULT 0,
+                lookup_completed INTEGER NOT NULL DEFAULT 0,
+                finalized INTEGER NOT NULL DEFAULT 0)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS hermes_api_usage (
+                api_request_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS hermes_verified_recipes (
+                recipe_id TEXT PRIMARY KEY,
+                recipe_json TEXT NOT NULL,
+                stored_at TEXT NOT NULL)""")
+        self._hydrate_cache()
 
     def _db(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.config.state_path, timeout=10)
         db.row_factory = sqlite3.Row
         return db
+
+    @staticmethod
+    def _run_id(values: Mapping[str, Any]) -> str:
+        return str(values.get("turn_id") or values.get("task_id") or "")
+
+    @staticmethod
+    def _recipe_document(recipe: VerifiedActionRecipe) -> dict[str, Any]:
+        return {
+            "recipe_id": recipe.recipe_id,
+            "normalized_task_intent": recipe.normalized_task_intent,
+            "tool_capability_sequence": [
+                {
+                    "tool": step.tool,
+                    "capability": step.capability,
+                    "side_effecting": step.side_effecting,
+                }
+                for step in recipe.tool_capability_sequence
+            ],
+            "relevant_inputs": _plain(recipe.relevant_inputs),
+            "preconditions": _plain(recipe.preconditions),
+            "execution_strategy": _plain(recipe.execution_strategy),
+            "expected_outcome": _plain(recipe.expected_outcome),
+            "verification_evidence": [
+                {"summary": item.summary, "reference": item.reference}
+                for item in recipe.verification_evidence
+            ],
+            "recipe_version": recipe.recipe_version,
+            "source_task_id": recipe.source_task_id,
+            "source_run_id": recipe.source_run_id,
+            "original_token_usage": recipe.original_token_usage,
+            "successful": recipe.successful,
+            "verified": recipe.verified,
+        }
+
+    @staticmethod
+    def _recipe_from_document(value: Mapping[str, Any]) -> VerifiedActionRecipe:
+        return VerifiedActionRecipe(
+            recipe_id=str(value["recipe_id"]),
+            normalized_task_intent=str(value["normalized_task_intent"]),
+            tool_capability_sequence=tuple(
+                RecipeStep(
+                    tool=str(item["tool"]),
+                    capability=str(item["capability"]),
+                    side_effecting=item.get("side_effecting") is True,
+                )
+                for item in value["tool_capability_sequence"]
+                if isinstance(item, Mapping)
+            ),
+            relevant_inputs=dict(value.get("relevant_inputs") or {}),
+            preconditions=dict(value.get("preconditions") or {}),
+            execution_strategy=dict(value.get("execution_strategy") or {}),
+            expected_outcome=dict(value.get("expected_outcome") or {}),
+            verification_evidence=tuple(
+                VerificationEvidence(
+                    summary=str(item["summary"]),
+                    reference=(
+                        str(item["reference"])
+                        if item.get("reference") is not None
+                        else None
+                    ),
+                )
+                for item in value["verification_evidence"]
+                if isinstance(item, Mapping)
+            ),
+            recipe_version=str(value["recipe_version"]),
+            source_task_id=str(value["source_task_id"]),
+            source_run_id=str(value["source_run_id"]),
+            original_token_usage=int(value["original_token_usage"]),
+            successful=value.get("successful") is True,
+            verified=value.get("verified") is True,
+        )
+
+    def _hydrate_cache(self) -> None:
+        if not self.config.verified_action_cache_enabled:
+            return
+        with self._db() as db:
+            documents = tuple(
+                row[0]
+                for row in db.execute(
+                    "SELECT recipe_json FROM hermes_verified_recipes ORDER BY stored_at"
+                )
+            )
+        for document in documents:
+            try:
+                value = json.loads(document)
+                if isinstance(value, Mapping):
+                    self._cache.store(self._recipe_from_document(value))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                # A malformed persisted recipe is never eligible for reuse.
+                continue
+
+    def pre_llm_call(self, **kw: Any) -> dict[str, str] | None:
+        """Look up a verified strategy before Hermes plans the current turn."""
+
+        if not self.config.verified_action_cache_enabled:
+            return None
+        run_id = self._run_id(kw)
+        task_id = str(kw.get("task_id") or "")
+        session_id = str(kw.get("session_id") or "")
+        turn_id = str(kw.get("turn_id") or "")
+        intent = str(kw.get("user_message") or "").strip()
+        if not run_id or not task_id or not session_id or not intent:
+            return None
+        with self._lock, self._db() as db:
+            existing = db.execute(
+                "SELECT lookup_completed,candidate_recipe_id,match_type,"
+                "match_confidence FROM hermes_cache_runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            match: CacheMatch | None = None
+            if existing is None or not existing["lookup_completed"]:
+                request = ReuseRequest(
+                    task_id=task_id,
+                    run_id=run_id,
+                    task_intent=intent,
+                    relevant_inputs={},
+                )
+                match = self._cache.lookup(request)
+                db.execute(
+                    "INSERT INTO hermes_cache_runs("
+                    "run_id,task_id,session_id,turn_id,task_intent,"
+                    "candidate_recipe_id,match_type,match_confidence,lookup_completed"
+                    ") VALUES(?,?,?,?,?,?,?,?,1) "
+                    "ON CONFLICT(run_id) DO UPDATE SET "
+                    "task_id=excluded.task_id,session_id=excluded.session_id,"
+                    "turn_id=excluded.turn_id,task_intent=excluded.task_intent,"
+                    "candidate_recipe_id=excluded.candidate_recipe_id,"
+                    "match_type=excluded.match_type,"
+                    "match_confidence=excluded.match_confidence,lookup_completed=1",
+                    (
+                        run_id,
+                        task_id,
+                        session_id,
+                        turn_id,
+                        intent,
+                        None if match is None else match.recipe.recipe_id,
+                        None if match is None else match.kind.value,
+                        None if match is None else match.score,
+                    ),
+                )
+            elif existing["candidate_recipe_id"]:
+                recipe = self._recipe_by_id(str(existing["candidate_recipe_id"]))
+                if recipe is not None:
+                    from runmantle.verified_action_cache import CacheMatchKind
+
+                    match = CacheMatch(
+                        recipe=recipe,
+                        kind=CacheMatchKind(str(existing["match_type"])),
+                        score=float(existing["match_confidence"]),
+                    )
+        if match is None:
+            return None
+        steps = ", ".join(
+            f"{step.tool} ({step.capability})"
+            for step in match.recipe.tool_capability_sequence
+        )
+        argument_keys = match.recipe.execution_strategy.get("argument_keys") or ()
+        return {
+            "context": (
+                "RunMantle found a previously successful, verified execution recipe "
+                f"({match.kind.value} match, confidence {match.score:.3f}). "
+                f"Candidate tool sequence: {steps}. Expected argument keys: "
+                f"{', '.join(str(key) for key in argument_keys) or 'none'}. "
+                "Use current task inputs only. This recipe is not authorization; "
+                "the current policy, approval, dispatch, receipt, runtime "
+                "confirmation, and verification gates still apply."
+            )
+        }
+
+    def post_api_request(self, **kw: Any) -> None:
+        """Accumulate only provider-reported Hermes token usage for this run."""
+
+        if not self.config.verified_action_cache_enabled:
+            return
+        run_id = self._run_id(kw)
+        api_request_id = str(kw.get("api_request_id") or "")
+        usage = kw.get("usage")
+        if not run_id or not api_request_id or not isinstance(usage, Mapping):
+            return
+        try:
+            raw_input_tokens = (
+                usage.get("prompt_tokens")
+                if usage.get("prompt_tokens") is not None
+                else usage.get("input_tokens") or 0
+            )
+            input_tokens = int(str(raw_input_tokens))
+            output_tokens = int(str(usage.get("output_tokens") or 0))
+            duration_ms = max(0, round(float(kw.get("api_duration") or 0) * 1000))
+        except (TypeError, ValueError):
+            return
+        if input_tokens < 0 or output_tokens < 0:
+            return
+        with self._lock, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            inserted = db.execute(
+                "INSERT OR IGNORE INTO hermes_api_usage("
+                "api_request_id,run_id,input_tokens,output_tokens,duration_ms"
+                ") VALUES(?,?,?,?,?)",
+                (
+                    api_request_id,
+                    run_id,
+                    input_tokens,
+                    output_tokens,
+                    duration_ms,
+                ),
+            ).rowcount
+            if inserted:
+                db.execute(
+                    "UPDATE hermes_cache_runs SET "
+                    "input_tokens=input_tokens+?,output_tokens=output_tokens+?,"
+                    "duration_ms=duration_ms+?,usage_observed=1 WHERE run_id=?",
+                    (input_tokens, output_tokens, duration_ms, run_id),
+                )
+
+    def post_llm_call(self, **kw: Any) -> None:
+        """Finalize verified cache evidence after Hermes finishes the turn."""
+
+        if not self.config.verified_action_cache_enabled:
+            return
+        run_id = self._run_id(kw)
+        if run_id:
+            self._finalize_cache_run(run_id)
+
+    def _recipe_by_id(self, recipe_id: str) -> VerifiedActionRecipe | None:
+        with self._db() as db:
+            row = db.execute(
+                "SELECT recipe_json FROM hermes_verified_recipes WHERE recipe_id=?",
+                (recipe_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(row[0])
+            return (
+                self._recipe_from_document(value)
+                if isinstance(value, Mapping)
+                else None
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    def _cache_decision_for_call(
+        self,
+        kw: Mapping[str, Any],
+        tool: ToolDescriptor,
+        args_hash: str,
+    ) -> tuple[str, CacheMatch | None, tuple[PreconditionResult, ...]]:
+        """Bind a pre-LLM candidate to fresh current-call facts."""
+
+        run_id = self._run_id(kw)
+        if not self.config.verified_action_cache_enabled or not run_id:
+            return "miss", None, ()
+        with self._db() as db:
+            run = db.execute(
+                "SELECT * FROM hermes_cache_runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+        if run is None or not run["candidate_recipe_id"]:
+            return "miss", None, ()
+        recipe = self._recipe_by_id(str(run["candidate_recipe_id"]))
+        if recipe is None:
+            return "miss", None, ()
+        from runmantle.verified_action_cache import CacheMatchKind
+
+        match = CacheMatch(
+            recipe=recipe,
+            kind=CacheMatchKind(str(run["match_type"])),
+            score=float(run["match_confidence"]),
+        )
+        probe = self.config.post_action_probes.get(tool.name)
+        probe_material = probe if isinstance(probe, Mapping) else {}
+        validation = tuple(
+            _HermesRecipePreconditionValidator(
+                tool=tool,
+                args_hash=args_hash,
+                probe_hash=_hash(
+                    {"probe": redact(probe_material, self.config.redact_keys)}
+                ),
+            ).validate(
+                recipe,
+                ReuseRequest(
+                    task_id=str(kw.get("task_id") or ""),
+                    run_id=run_id,
+                    task_intent=str(run["task_intent"]),
+                    relevant_inputs={},
+                ),
+            )
+        )
+        if validation and all(item.passed for item in validation):
+            return "hit", match, validation
+        self._cache.metrics.validation_failure += 1
+        self._cache.metrics.fallback += 1
+        return "miss", match, validation
+
+    @staticmethod
+    def _measurement(
+        run: sqlite3.Row, *, tool_duration_ms: Any = None
+    ) -> dict[str, Any]:
+        duration_ms = int(run["duration_ms"])
+        try:
+            if tool_duration_ms is not None:
+                duration_ms += max(0, int(tool_duration_ms))
+        except (TypeError, ValueError):
+            pass
+        input_tokens = int(run["input_tokens"])
+        output_tokens = int(run["output_tokens"])
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "duration_ms": duration_ms,
+            "kind": "measured",
+        }
+
+    def _new_recipe(
+        self,
+        run: sqlite3.Row,
+        action: sqlite3.Row,
+        measurement: Mapping[str, Any],
+    ) -> VerifiedActionRecipe:
+        request = json.loads(action["request_json"])
+        descriptor = request["tool_descriptor"]
+        tool_name = str(descriptor["name"])
+        probe = self.config.post_action_probes.get(tool_name)
+        probe_material = probe if isinstance(probe, Mapping) else {}
+        evidence = json.loads(action["evidence_json"])
+        recipe_id = "hermes:" + _hash(
+            {
+                "intent": str(run["task_intent"]),
+                "tool": tool_name,
+                "capability": str(descriptor["capability"]),
+                "args_hash": str(request["args_hash"]),
+                "probe_hash": _hash(
+                    {"probe": redact(probe_material, self.config.redact_keys)}
+                ),
+            }
+        )
+        expected = probe_material.get("expected_state")
+        expected_outcome = dict(expected) if isinstance(expected, Mapping) else {}
+        return VerifiedActionRecipe(
+            recipe_id=recipe_id,
+            normalized_task_intent=str(run["task_intent"]),
+            tool_capability_sequence=(
+                RecipeStep(
+                    tool=tool_name,
+                    capability=str(descriptor["capability"]),
+                    side_effecting=descriptor.get("side_effecting") is True,
+                ),
+            ),
+            relevant_inputs={},
+            preconditions={
+                "tool": tool_name,
+                "capability": str(descriptor["capability"]),
+                "tool_descriptor_hash": _hash({"descriptor": descriptor}),
+                "args_hash": str(request["args_hash"]),
+                "probe_hash": _hash(
+                    {"probe": redact(probe_material, self.config.redact_keys)}
+                ),
+            },
+            execution_strategy={
+                "tool": tool_name,
+                "capability": str(descriptor["capability"]),
+                "argument_keys": sorted(
+                    str(key) for key in request.get("argument_keys") or ()
+                ),
+                "baseline": dict(measurement),
+            },
+            expected_outcome=expected_outcome,
+            verification_evidence=(
+                VerificationEvidence(
+                    summary="Hermes action receipt and fresh runtime probe verified",
+                    reference=str(evidence["checksum"]),
+                ),
+            ),
+            recipe_version="hermes-v1",
+            source_task_id=str(run["task_id"]),
+            source_run_id=str(run["run_id"]),
+            original_token_usage=int(measurement["total_tokens"]),
+        )
+
+    def _store_recipe(self, recipe: VerifiedActionRecipe) -> None:
+        self._cache.store(recipe)
+        with self._db() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO hermes_verified_recipes("
+                "recipe_id,recipe_json,stored_at) VALUES(?,?,?)",
+                (
+                    recipe.recipe_id,
+                    _canonical(self._recipe_document(recipe)),
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+
+    def _finalize_cache_run(self, run_id: str) -> None:
+        with self._lock, self._db() as db:
+            run = db.execute(
+                "SELECT * FROM hermes_cache_runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            action = db.execute(
+                "SELECT * FROM hermes_actions WHERE run_id=? "
+                "ORDER BY rowid DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        if (
+            run is None
+            or action is None
+            or run["finalized"]
+            or not run["usage_observed"]
+            or action["verification_status"] != "verified"
+            or not action["receipt_delivered"]
+            or not action["confirmation_delivered"]
+        ):
+            return
+        receipt = json.loads(action["receipt_json"])
+        measurement = self._measurement(
+            run, tool_duration_ms=receipt.get("duration_ms")
+        )
+        if measurement["total_tokens"] <= 0:
+            # Zero is valid provider data but cannot prove a measured comparison.
+            return
+
+        cache_status = str(action["cache_status"] or "miss")
+        recipe = (
+            self._recipe_by_id(str(action["recipe_id"]))
+            if action["recipe_id"]
+            else None
+        )
+        validation = json.loads(action["validation_json"] or "{}")
+        failed_checks = [
+            item
+            for item in validation.get("checks") or []
+            if isinstance(item, Mapping) and item.get("passed") is not True
+        ]
+        new_recipe: VerifiedActionRecipe | None = None
+        if cache_status == "miss" and recipe is None:
+            new_recipe = self._new_recipe(run, action, measurement)
+            recipe = new_recipe
+        if cache_status == "hit" and recipe is None:
+            return
+
+        baseline = measurement
+        reused: Mapping[str, Any] | None = None
+        if cache_status == "hit":
+            source = recipe.execution_strategy.get("baseline") if recipe else None
+            if not isinstance(source, Mapping) or source.get("kind") != "measured":
+                return
+            baseline = dict(source)
+            reused = measurement
+
+        payload: dict[str, Any] = {
+            "message_id": f"hermes:{run_id}:verified-action-cache",
+            "runtime_id": self.config.runtime_id,
+            "run_id": run_id,
+            "task_id": str(run["task_id"]),
+            "decision_id": str(action["decision_id"]),
+            "receipt_id": str(receipt["receipt_id"]),
+            "cache_status": cache_status,
+            "recipe_id": None if recipe is None else recipe.recipe_id,
+            "match_type": (
+                str(action["match_type"]) if action["match_type"] else "none"
+            ),
+            "match_confidence": (
+                float(action["match_confidence"])
+                if action["match_confidence"] is not None
+                else None
+            ),
+            "validation_result": "failed" if failed_checks else "verified",
+            "fallback_reason": (
+                "verified recipe preconditions changed" if failed_checks else None
+            ),
+            "baseline": baseline,
+            "reused": reused,
+            "final_task_success": True,
+            "verification_status": "verified",
+            "human_intervention": action["approval_id"] is not None,
+        }
+        if cache_status == "hit" and recipe is not None:
+            payload.update(
+                {
+                    "recipe_source_run_id": recipe.source_run_id,
+                    "recipe_source_task_id": recipe.source_task_id,
+                }
+            )
+        try:
+            self.client.record_verified_action_cache_telemetry(payload)
+        except (AttributeError, CortexOpsControlError, TypeError, ValueError):
+            return
+
+        if new_recipe is not None:
+            self._store_recipe(new_recipe)
+            self._cache.metrics.fallback += 1
+        elif cache_status == "hit" and recipe is not None:
+            self._cache.metrics.successful_reuse += 1
+            self._cache.metrics.tokens_avoided += max(
+                recipe.original_token_usage - int(measurement["total_tokens"]), 0
+            )
+        with self._db() as db:
+            db.execute(
+                "UPDATE hermes_cache_runs SET finalized=1 WHERE run_id=?",
+                (run_id,),
+            )
 
     def _refresh_tools(self) -> bool:
         try:
@@ -400,6 +1057,13 @@ class HermesControlAdapter:
                 "message": "BLOCKED: CortexOps action is already final or unavailable",
             }
         args_hash = _hash(args)
+        try:
+            cache_status, cache_match, cache_validation = self._cache_decision_for_call(
+                kw, tool, args_hash
+            )
+        except (KeyError, TypeError, ValueError, sqlite3.Error):
+            # Cache availability never weakens the mandatory control path.
+            cache_status, cache_match, cache_validation = "miss", None, ()
         action_id = _hash(
             {
                 "task_id": task_id,
@@ -452,6 +1116,8 @@ class HermesControlAdapter:
                 }
                 capabilities.add(tool.capability)
                 capabilities.update({"govern.v2", "govern.receipt.v1"})
+                if self.config.verified_action_cache_enabled:
+                    capabilities.add("verified_action_cache.telemetry.v1")
                 self.client.register_runtime(capabilities)
             self._register_task(contract, session_id)
             decision = self.client.evaluate_action(
@@ -469,7 +1135,9 @@ class HermesControlAdapter:
                 db.execute(
                     "INSERT INTO hermes_actions("
                     "tool_call_id,action_id,action_hash,decision_id,"
-                    "decision_json,request_json,state) VALUES(?,?,?,?,?,?,?)",
+                    "decision_json,request_json,state,run_id,cache_status,"
+                    "recipe_id,match_type,match_confidence,validation_json"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         call_id,
                         action_id,
@@ -480,10 +1148,28 @@ class HermesControlAdapter:
                             {
                                 "action_id": action_id,
                                 "args_hash": args_hash,
+                                "argument_keys": sorted(str(key) for key in args),
                                 "tool_descriptor": tool.as_dict(),
                             }
                         ),
                         state,
+                        self._run_id(kw) or task_id,
+                        cache_status,
+                        None if cache_match is None else cache_match.recipe.recipe_id,
+                        None if cache_match is None else cache_match.kind.value,
+                        None if cache_match is None else cache_match.score,
+                        _canonical(
+                            {
+                                "checks": [
+                                    {
+                                        "name": item.name,
+                                        "passed": item.passed,
+                                        "message": item.message,
+                                    }
+                                    for item in cache_validation
+                                ]
+                            }
+                        ),
                     ),
                 )
             if decision["outcome"] == "ALLOW":
@@ -734,26 +1420,64 @@ class HermesControlAdapter:
                     )
             except CortexOpsControlError:
                 return
+        with self._db() as db:
+            current = db.execute(
+                "SELECT * FROM hermes_actions WHERE tool_call_id=?",
+                (row["tool_call_id"],),
+            ).fetchone()
+        if current is None or kw.get("status") != "ok":
+            return
         if (
-            kw.get("status") == "ok"
-            and not row["confirmation_delivered"]
-            and self._send_probe(row, kw)
+            not current["confirmation_delivered"]
+            or current["verification_status"] == "awaiting_task_sync"
         ):
+            verification = self._send_probe(current, kw)
+            if verification is None:
+                return
+            stored_status = (
+                "awaiting_task_sync"
+                if verification.result.status is VerificationStatus.VERIFIED
+                else verification.result.status.value
+            )
             with self._db() as db:
                 db.execute(
-                    "UPDATE hermes_actions SET confirmation_delivered=1 "
-                    "WHERE tool_call_id=?",
-                    (row["tool_call_id"],),
+                    "UPDATE hermes_actions SET confirmation_delivered=1,"
+                    "verification_status=?,evidence_json=? WHERE tool_call_id=?",
+                    (
+                        stored_status,
+                        _canonical(
+                            {
+                                "evidence_id": verification.evidence.evidence_id,
+                                "checksum": verification.evidence.checksum,
+                                "criteria": [
+                                    {
+                                        "name": item.name,
+                                        "passed": item.passed,
+                                        "conclusive": item.conclusive,
+                                    }
+                                    for item in verification.result.criteria
+                                ],
+                            }
+                        ),
+                        current["tool_call_id"],
+                    ),
                 )
+            if verification.result.status is VerificationStatus.VERIFIED:
+                self._sync_verified_task(current, kw, verification)
 
-    def _send_probe(self, row: sqlite3.Row, kw: Mapping[str, Any]) -> bool:
+    def _send_probe(
+        self, row: sqlite3.Row, kw: Mapping[str, Any]
+    ) -> _HermesProbeVerification | None:
         probe = (self.config.post_action_probes or {}).get(
             str(kw.get("tool_name") or "")
         )
         if not isinstance(probe, Mapping):
-            return True
+            # An executor success without fresh outcome evidence is not verified.
+            return None
         observed: dict[str, Any] = {}
         expected = dict(probe.get("expected_state") or {})
+        if not expected:
+            return None
         status = "confirmed"
         try:
             for label in ("version_url", "health_url"):
@@ -770,6 +1494,11 @@ class HermesControlAdapter:
         except Exception as error:  # noqa: BLE001 - probes are non-authoritative evidence
             status, observed = "inconclusive", {"probe_error": type(error).__name__}
         receipt = json.loads(row["receipt_json"]) if row["receipt_json"] else {}
+        checked_at = str(
+            receipt.get("ended_at")
+            or receipt.get("occurred_at")
+            or datetime.now(UTC).isoformat()
+        )
         payload = {
             "message_id": f"hermes:{row['tool_call_id']}:probe",
             "runtime_id": self.config.runtime_id,
@@ -785,21 +1514,107 @@ class HermesControlAdapter:
             "observed_state": observed,
             "expected_state": expected,
             "evidence_ids": [
+                str(receipt.get("receipt_id") or f"hermes:{row['tool_call_id']}"),
                 f"hermes:{row['tool_call_id']}:version",
                 f"hermes:{row['tool_call_id']}:health",
             ],
-            "checked_at": datetime.now(UTC).isoformat(),
+            "checked_at": checked_at,
             "actor": "runmantle.hermes_control",
         }
+        request_data = json.loads(row["request_json"])
+        descriptor = request_data.get("tool_descriptor") or {}
+        try:
+            contract = hermes_task_contract(
+                str(kw.get("task_id") or ""),
+                str(kw.get("session_id") or ""),
+                capability=str(descriptor["capability"]),
+                risk_level=RiskLevel(str(descriptor["risk_level"])),
+                expected_state=expected,
+            )
+            evidence = _establish_evidence_origin(
+                EvidenceItem(
+                    evidence_id=f"hermes:{row['tool_call_id']}:runtime-probe",
+                    type="hermes_tool_runtime",
+                    source="runmantle.hermes.http_probe",
+                    collected_at=datetime.fromisoformat(checked_at),
+                    payload=observed,
+                ),
+                boundary="runmantle.hermes_control.post_action_probe",
+                provider_identity="runmantle.hermes.http_probe:v1",
+                provider_configuration={
+                    "version_url": str(probe.get("version_url") or ""),
+                    "health_url": str(probe.get("health_url") or ""),
+                    "expected_state_hash": _hash({"expected": expected}),
+                },
+                trust_level=EvidenceTrustLevel.RUNTIME_OBSERVED,
+                acquisition_method=EvidenceAcquisitionMethod.RUNTIME_OBSERVED,
+            )
+            result = RuleBasedVerifier().verify(
+                contract,
+                {"executed": True},
+                EvidenceCollection((evidence,)),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
         try:
             self.client.transport.request(
                 "POST",
                 f"/api/runmantle/v1/actions/{row['decision_id']}/runtime-confirmations",
                 payload,
             )
-            return True
+            return _HermesProbeVerification(result, evidence, contract)
         except CortexOpsControlError:
-            return False
+            return None
+
+    def _sync_verified_task(
+        self,
+        row: sqlite3.Row,
+        kw: Mapping[str, Any],
+        verification: _HermesProbeVerification,
+    ) -> None:
+        material = {
+            "status": verification.result.status.value,
+            "criteria": [
+                {
+                    "name": item.name,
+                    "passed": item.passed,
+                    "conclusive": item.conclusive,
+                }
+                for item in verification.result.criteria
+            ],
+            "evidence_ids": [verification.evidence.evidence_id],
+        }
+        verification_hash = _digest(material)
+        task_id = str(kw.get("task_id") or "")
+        try:
+            response = self.client.transport.request(
+                "POST",
+                "/api/runmantle/v1/tasks/status",
+                {
+                    "request_id": (
+                        f"runtime:{self.config.runtime_id}:hermes-task:"
+                        f"{task_id}:verified"
+                    ),
+                    "runtime_id": self.config.runtime_id,
+                    "task_id": task_id,
+                    "contract_hash": _digest(
+                        task_contract_telemetry(verification.contract)
+                    ),
+                    "status": "verified",
+                    "sequence": 1,
+                    "verification_hash": verification_hash,
+                },
+            )
+            if response.get("verified_status") != "verified":
+                return
+        except CortexOpsControlError:
+            return
+        with self._db() as db:
+            db.execute(
+                "UPDATE hermes_actions SET verification_status='verified',"
+                "verification_hash=? WHERE tool_call_id=?",
+                (verification_hash, row["tool_call_id"]),
+            )
 
 
 def register(ctx: Any) -> None:
@@ -817,13 +1632,18 @@ def register(ctx: Any) -> None:
         "approval_poll_max_seconds",
         "blocking_hook_approval",
         "govern_read_only_tools",
+        "verified_action_cache_enabled",
+        "verified_action_cache_similarity_threshold",
         "redact_keys",
     )
     adapter = HermesControlAdapter(
         HermesControlConfig.from_settings({key: ctx.get_config(key) for key in keys})
     )
+    ctx.register_hook("pre_llm_call", adapter.pre_llm_call)
+    ctx.register_hook("post_api_request", adapter.post_api_request)
     ctx.register_hook("pre_tool_call", adapter.pre_tool_call)
     ctx.register_hook("post_tool_call", adapter.post_tool_call)
+    ctx.register_hook("post_llm_call", adapter.post_llm_call)
     ctx.register_approval_transport("cortexops", adapter.present_approval)
 
 

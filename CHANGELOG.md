@@ -6,6 +6,24 @@ All notable changes to Runmantle are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-11
+
+### Added
+
+- end-to-end Verified Action Cache integration in the Hermes control path,
+  including exact-first lookup, persisted recipes, fresh precondition checks,
+  governed reuse, and independent outcome re-verification;
+- measured CortexOps baseline and reuse telemetry sourced from Hermes provider
+  token usage, with no estimated or fabricated savings;
+- Hermes regression coverage proving a measured first-run baseline followed by
+  measured cache reuse, plus rejection of failed or unverified recipe sources.
+
+### Changed
+
+- the Hermes plugin now observes LLM calls and API usage in addition to tool
+  calls while preserving policy, approval, receipt, and runtime confirmation
+  gates for every execution.
+
 ## [1.1.2] - 2026-09-11
 
 ### Fixed
