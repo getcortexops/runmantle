@@ -13,7 +13,9 @@ from runmantle.integrations.cortexops_control import (
 from runmantle.integrations.hermes_control import (
     HermesControlAdapter,
     HermesControlConfig,
+    _safe_replay_args,
 )
+from runmantle.tool_discovery import ToolDiscoveryError
 
 
 class _Transport:
@@ -185,6 +187,17 @@ def _call() -> dict[str, Any]:
         "session_id": "s",
         "tool_call_id": "c",
     }
+
+
+def test_replay_material_rejects_sensitive_or_non_json_arguments() -> None:
+    keys = frozenset({"authorization", "token", "secret", "password", "api_key"})
+    assert _safe_replay_args({"command": "deploy-v2"}, keys) == {
+        "command": "deploy-v2"
+    }
+    assert _safe_replay_args(
+        {"command": "deploy-v2", "token": "do-not-store"}, keys
+    ) is None
+    assert _safe_replay_args({"values": {1, 2}}, keys) is None
 
 
 def _assert_approval(adapter: HermesControlAdapter) -> None:
@@ -436,6 +449,183 @@ def test_real_hermes_hook_sequence_records_measured_baseline_then_reuse(
     assert reused["recipe_source_run_id"] == "run-baseline"
     assert adapter._cache.metrics.successful_reuse == 1
     assert adapter._cache.metrics.tokens_avoided == 65
+
+
+def _prepare_pre_model_reuse(
+    adapter: HermesControlAdapter,
+    *,
+    intent: str = "Deploy version two to the local service",
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    common = {
+        "task_id": "task-pre-model",
+        "session_id": "session-pre-model",
+        "turn_id": "run-pre-model",
+    }
+    adapter.pre_llm_call(**common, user_message=intent)
+    dispatches: list[dict[str, Any]] = []
+
+    def dispatch_tool(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+        call = {
+            **common,
+            "tool_name": tool_name,
+            "tool_call_id": "call-pre-model",
+            "args": args,
+        }
+        directive = adapter.pre_tool_call(**call)
+        dispatches.append({"directive": directive, "args": dict(args)})
+        status = "ok" if directive is None else "blocked"
+        adapter.post_tool_call(
+            **call,
+            status=status,
+            result="deployed" if status == "ok" else "blocked",
+            duration_ms=2,
+        )
+        return {"tool_call_id": call["tool_call_id"], "result": status}
+
+    return {
+        **common,
+        "user_message": intent,
+        "dispatch_tool": dispatch_tool,
+    }, dispatches
+
+
+def test_exact_verified_recipe_completes_pre_model_with_zero_measured_tokens(
+    tmp_path: Path,
+) -> None:
+    adapter, client = _cache_adapter(tmp_path)
+    with patch(
+        "runmantle.integrations.hermes_control.urlopen",
+        side_effect=_probe_urlopen,
+    ):
+        _run_verified_cache_turn(
+            adapter,
+            task_id="task-baseline",
+            turn_id="run-baseline",
+            call_id="call-baseline",
+            input_tokens=80,
+            output_tokens=20,
+        )
+        hook_args, dispatches = _prepare_pre_model_reuse(adapter)
+        completed = adapter.pre_model_completion(**hook_args)
+
+    assert completed == {
+        "complete_turn": True,
+        "response": "Deployment complete.",
+    }
+    assert dispatches == [{"directive": None, "args": {"command": "deploy-v2"}}]
+    assert len(client.cache_telemetry) == 2
+    reused = client.cache_telemetry[-1]
+    assert reused["baseline"]["total_tokens"] == 100
+    assert reused["reused"] == {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "duration_ms": 2,
+        "kind": "measured",
+    }
+    assert "provider_request_avoided" not in reused
+    assert "args" not in reused
+    assert "final_response" not in reused
+    assert adapter._cache.metrics.tokens_avoided == 100
+
+
+def test_similar_recipe_never_dispatches_pre_model(tmp_path: Path) -> None:
+    adapter, _ = _cache_adapter(tmp_path)
+    with patch(
+        "runmantle.integrations.hermes_control.urlopen",
+        side_effect=_probe_urlopen,
+    ):
+        _run_verified_cache_turn(
+            adapter,
+            task_id="task-baseline",
+            turn_id="run-baseline",
+            call_id="call-baseline",
+            input_tokens=80,
+            output_tokens=20,
+        )
+        hook_args, dispatches = _prepare_pre_model_reuse(
+            adapter,
+            intent="Deploy version two to the local service now",
+        )
+        completed = adapter.pre_model_completion(**hook_args)
+
+    assert completed is None
+    assert dispatches == []
+
+
+def test_unavailable_replay_tool_falls_back_without_dispatch(tmp_path: Path) -> None:
+    adapter, _ = _cache_adapter(tmp_path)
+    with patch(
+        "runmantle.integrations.hermes_control.urlopen",
+        side_effect=_probe_urlopen,
+    ):
+        _run_verified_cache_turn(
+            adapter,
+            task_id="task-baseline",
+            turn_id="run-baseline",
+            call_id="call-baseline",
+            input_tokens=80,
+            output_tokens=20,
+        )
+        hook_args, dispatches = _prepare_pre_model_reuse(adapter)
+        with patch.object(
+            adapter,
+            "_tool",
+            side_effect=ToolDiscoveryError("tool unavailable"),
+        ):
+            completed = adapter.pre_model_completion(**hook_args)
+
+    assert completed is None
+    assert dispatches == []
+
+
+def test_denied_pre_model_replay_never_completes_early(tmp_path: Path) -> None:
+    adapter, client = _cache_adapter(tmp_path)
+    with patch(
+        "runmantle.integrations.hermes_control.urlopen",
+        side_effect=_probe_urlopen,
+    ):
+        _run_verified_cache_turn(
+            adapter,
+            task_id="task-baseline",
+            turn_id="run-baseline",
+            call_id="call-baseline",
+            input_tokens=80,
+            output_tokens=20,
+        )
+        client.outcome = "DENY"
+        hook_args, dispatches = _prepare_pre_model_reuse(adapter)
+        completed = adapter.pre_model_completion(**hook_args)
+
+    assert completed is None
+    assert dispatches and dispatches[0]["directive"]["action"] == "block"
+    assert len(client.cache_telemetry) == 1
+
+
+def test_unverified_pre_model_replay_never_completes_early(tmp_path: Path) -> None:
+    adapter, client = _cache_adapter(tmp_path)
+    with patch(
+        "runmantle.integrations.hermes_control.urlopen",
+        side_effect=_probe_urlopen,
+    ):
+        _run_verified_cache_turn(
+            adapter,
+            task_id="task-baseline",
+            turn_id="run-baseline",
+            call_id="call-baseline",
+            input_tokens=80,
+            output_tokens=20,
+        )
+    with patch(
+        "runmantle.integrations.hermes_control.urlopen",
+        side_effect=_stale_probe_urlopen,
+    ):
+        hook_args, dispatches = _prepare_pre_model_reuse(adapter)
+        completed = adapter.pre_model_completion(**hook_args)
+
+    assert completed is None
+    assert dispatches == [{"directive": None, "args": {"command": "deploy-v2"}}]
+    assert len(client.cache_telemetry) == 1
 
 
 def test_unverified_hermes_outcome_never_creates_a_recipe(tmp_path: Path) -> None:

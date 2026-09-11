@@ -52,11 +52,14 @@ not as the scope of governed tools. Set `govern_read_only_tools: true` to route 
 through policy as well.
 
 The plugin also wires RunMantle's Verified Action Cache into Hermes's turn and
-tool hooks. `pre_llm_call` performs exact-first recipe lookup and supplies only
-the verified tool/capability strategy to Hermes. `pre_tool_call` freshly checks
-the discovered tool descriptor, capability, argument hash, and configured
-runtime probe before the usual CortexOps policy and approval flow. Recipe reuse
-therefore does not replay a permit or dispatch a tool directly.
+tool hooks. `pre_llm_call` retains its context-injection behavior and performs
+exact-first recipe lookup. On an exact match, `pre_model_completion` may replay
+the recorded action through Hermes's turn-scoped normal tool dispatcher before
+any provider request. Similar matches, missing replay data, and changed
+preconditions fall through to normal model planning. `pre_tool_call` freshly
+checks the discovered tool descriptor, capability, argument hash, and configured
+runtime probe before the usual CortexOps policy and approval flow; no permit or
+prior receipt is reused.
 
 After execution, the normal receipt is delivered first and the configured
 `post_action_probes` are evaluated by RunMantle's rule verifier. Only a
@@ -65,9 +68,13 @@ reported usage from Hermes's `post_api_request` hook is summed across the turn;
 when it is unavailable, the plugin neither invents a measurement nor creates a
 measured recipe baseline. `post_llm_call` sends the resulting miss/baseline or
 hit/reuse observation to CortexOps's
-`/api/runmantle/v1/verified-action-cache/telemetry` endpoint. Recipes persist in
-the plugin's SQLite `state_path`, while approvals, receipts, confirmation, and
-verification are performed anew after a restart.
+`/api/runmantle/v1/verified-action-cache/telemetry` endpoint. An independently
+verified pre-model replay reports the recorded measured baseline and measured
+reuse token counts of zero because Hermes actually avoided the provider call.
+Only JSON-safe arguments unchanged by redaction are retained for replay; secret-
+bearing actions remain normal model turns. Recipes persist in the plugin's
+SQLite `state_path`, while approvals, receipts, confirmation, and verification
+are performed anew after a restart.
 
 `cortexops_url` is the CortexOps origin (as above). The transport creates a CortexOps
 pending approval for every `REQUIRE_APPROVAL`; it polls that authoritative record and

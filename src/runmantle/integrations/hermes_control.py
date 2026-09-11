@@ -101,6 +101,35 @@ def redact(value: Any, keys: frozenset[str]) -> Any:
     return value
 
 
+def _safe_replay_args(
+    value: Mapping[str, Any], keys: frozenset[str]
+) -> dict[str, Any] | None:
+    """Return exact JSON replay arguments only when redaction changes nothing.
+
+    A recipe that contains a secret-bearing field remains useful as a planning
+    hint, but it is deliberately ineligible for model-free replay. This keeps
+    authorization material out of the durable recipe while avoiding a lossy
+    redacted replay that could target a different action.
+    """
+
+    plain = _plain(value)
+    if not isinstance(plain, dict) or redact(plain, keys) != plain:
+        return None
+    try:
+        encoded = json.dumps(
+            plain,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        decoded = json.loads(encoded)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(decoded, dict) or decoded != plain:
+        return None
+    return decoded
+
+
 def _expected_leaves(
     value: Mapping[str, Any], prefix: str = ""
 ) -> list[tuple[str, Any]]:
@@ -673,7 +702,197 @@ class HermesControlAdapter:
             return
         run_id = self._run_id(kw)
         if run_id:
-            self._finalize_cache_run(run_id)
+            self._finalize_cache_run(
+                run_id,
+                assistant_response=kw.get("assistant_response"),
+            )
+
+    def pre_model_completion(self, **kw: Any) -> dict[str, Any] | None:
+        """Replay one exact verified recipe before Hermes calls a model.
+
+        Every replay re-enters Hermes's dispatcher, so the current CortexOps
+        policy, approval, dispatch permit, execution receipt, runtime probe,
+        and task-status verification all run again. Any missing or
+        inconclusive fact falls through to ordinary model planning.
+        """
+
+        if not self.config.verified_action_cache_enabled:
+            return None
+        run_id = self._run_id(kw)
+        dispatch_tool = kw.get("dispatch_tool")
+        if not run_id or not callable(dispatch_tool):
+            return None
+        try:
+            with self._lock, self._db() as db:
+                run = db.execute(
+                    "SELECT * FROM hermes_cache_runs WHERE run_id=?", (run_id,)
+                ).fetchone()
+            if (
+                run is None
+                or str(run["match_type"] or "") != "exact"
+                or not run["candidate_recipe_id"]
+            ):
+                return None
+            recipe = self._recipe_by_id(str(run["candidate_recipe_id"]))
+            if recipe is None or not recipe.successful or not recipe.verified:
+                return None
+            replay = recipe.execution_strategy.get("replay")
+            if not isinstance(replay, Mapping):
+                return None
+            tool_name = replay.get("tool")
+            raw_args = replay.get("args")
+            final_response = replay.get("final_response")
+            if (
+                not isinstance(tool_name, str)
+                or not tool_name
+                or not isinstance(raw_args, Mapping)
+                or not isinstance(final_response, str)
+                or not final_response.strip()
+                or len(recipe.tool_capability_sequence) != 1
+                or recipe.tool_capability_sequence[0].tool != tool_name
+            ):
+                return None
+            replay_args = _safe_replay_args(raw_args, self.config.redact_keys)
+            if replay_args is None:
+                return None
+            tool = self._tool(tool_name)
+            cache_status, match, validation = self._cache_decision_for_call(
+                kw,
+                tool,
+                _hash(replay_args),
+            )
+            if (
+                cache_status != "hit"
+                or match is None
+                or match.kind.value != "exact"
+                or match.recipe.recipe_id != recipe.recipe_id
+                or not validation
+                or not all(item.passed for item in validation)
+            ):
+                return None
+
+            dispatch = dispatch_tool(tool_name, replay_args)
+            if not isinstance(dispatch, Mapping):
+                return None
+            tool_call_id = dispatch.get("tool_call_id")
+            if not isinstance(tool_call_id, str) or not tool_call_id:
+                return None
+            with self._lock, self._db() as db:
+                action = db.execute(
+                    "SELECT * FROM hermes_actions WHERE tool_call_id=? AND run_id=?",
+                    (tool_call_id, run_id),
+                ).fetchone()
+            if not self._verified_replay_action(action, recipe):
+                return None
+            if not self._record_pre_model_reuse(run, action, recipe):
+                return None
+            return {"complete_turn": True, "response": final_response}
+        except (
+            CortexOpsControlError,
+            ToolDiscoveryError,
+            KeyError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            OSError,
+            sqlite3.Error,
+        ):
+            return None
+
+    @staticmethod
+    def _verified_replay_action(
+        action: sqlite3.Row | None,
+        recipe: VerifiedActionRecipe,
+    ) -> bool:
+        if action is None:
+            return False
+        if (
+            action["state"] != "executed"
+            or action["cache_status"] != "hit"
+            or action["recipe_id"] != recipe.recipe_id
+            or action["match_type"] != "exact"
+            or not action["receipt_json"]
+            or not action["receipt_delivered"]
+            or not action["confirmation_delivered"]
+            or action["verification_status"] != "verified"
+            or not action["verification_hash"]
+            or not action["evidence_json"]
+        ):
+            return False
+        try:
+            receipt = json.loads(action["receipt_json"])
+            evidence = json.loads(action["evidence_json"])
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return bool(
+            isinstance(receipt, Mapping)
+            and receipt.get("outcome") == "succeeded"
+            and receipt.get("receipt_id")
+            and isinstance(evidence, Mapping)
+            and evidence.get("evidence_id")
+            and evidence.get("checksum")
+        )
+
+    def _record_pre_model_reuse(
+        self,
+        run: sqlite3.Row,
+        action: sqlite3.Row,
+        recipe: VerifiedActionRecipe,
+    ) -> bool:
+        """Emit measured zero-token reuse telemetry after fresh verification."""
+
+        baseline = recipe.execution_strategy.get("baseline")
+        if (
+            not isinstance(baseline, Mapping)
+            or baseline.get("kind") != "measured"
+            or int(baseline.get("total_tokens") or 0) <= 0
+        ):
+            return False
+        try:
+            receipt = json.loads(action["receipt_json"])
+            duration_ms = max(0, int(receipt.get("duration_ms") or 0))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        reused = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "duration_ms": duration_ms,
+            "kind": "measured",
+        }
+        payload = {
+            "message_id": f"hermes:{run['run_id']}:verified-action-cache",
+            "runtime_id": self.config.runtime_id,
+            "run_id": str(run["run_id"]),
+            "task_id": str(run["task_id"]),
+            "decision_id": str(action["decision_id"]),
+            "receipt_id": str(receipt["receipt_id"]),
+            "cache_status": "hit",
+            "recipe_id": recipe.recipe_id,
+            "match_type": "exact",
+            "match_confidence": 1.0,
+            "validation_result": "verified",
+            "fallback_reason": None,
+            "baseline": dict(baseline),
+            "reused": reused,
+            "final_task_success": True,
+            "verification_status": "verified",
+            "human_intervention": action["approval_id"] is not None,
+            "recipe_source_run_id": recipe.source_run_id,
+            "recipe_source_task_id": recipe.source_task_id,
+        }
+        try:
+            self.client.record_verified_action_cache_telemetry(payload)
+        except (AttributeError, CortexOpsControlError, TypeError, ValueError):
+            return False
+        self._cache.metrics.successful_reuse += 1
+        self._cache.metrics.tokens_avoided += recipe.original_token_usage
+        with self._db() as db:
+            db.execute(
+                "UPDATE hermes_cache_runs SET finalized=1 WHERE run_id=?",
+                (run["run_id"],),
+            )
+        return True
 
     def _recipe_by_id(self, recipe_id: str) -> VerifiedActionRecipe | None:
         with self._db() as db:
@@ -769,6 +988,7 @@ class HermesControlAdapter:
         run: sqlite3.Row,
         action: sqlite3.Row,
         measurement: Mapping[str, Any],
+        final_response: str | None,
     ) -> VerifiedActionRecipe:
         request = json.loads(action["request_json"])
         descriptor = request["tool_descriptor"]
@@ -790,6 +1010,30 @@ class HermesControlAdapter:
         )
         expected = probe_material.get("expected_state")
         expected_outcome = dict(expected) if isinstance(expected, Mapping) else {}
+        replay_args = request.get("replay_args")
+        replay = None
+        if (
+            isinstance(replay_args, Mapping)
+            and isinstance(final_response, str)
+            and final_response.strip()
+        ):
+            safe_args = _safe_replay_args(replay_args, self.config.redact_keys)
+            if safe_args is not None:
+                replay = {
+                    "tool": tool_name,
+                    "args": safe_args,
+                    "final_response": final_response,
+                }
+        strategy: dict[str, Any] = {
+            "tool": tool_name,
+            "capability": str(descriptor["capability"]),
+            "argument_keys": sorted(
+                str(key) for key in request.get("argument_keys") or ()
+            ),
+            "baseline": dict(measurement),
+        }
+        if replay is not None:
+            strategy["replay"] = replay
         return VerifiedActionRecipe(
             recipe_id=recipe_id,
             normalized_task_intent=str(run["task_intent"]),
@@ -810,14 +1054,7 @@ class HermesControlAdapter:
                     {"probe": redact(probe_material, self.config.redact_keys)}
                 ),
             },
-            execution_strategy={
-                "tool": tool_name,
-                "capability": str(descriptor["capability"]),
-                "argument_keys": sorted(
-                    str(key) for key in request.get("argument_keys") or ()
-                ),
-                "baseline": dict(measurement),
-            },
+            execution_strategy=strategy,
             expected_outcome=expected_outcome,
             verification_evidence=(
                 VerificationEvidence(
@@ -844,7 +1081,12 @@ class HermesControlAdapter:
                 ),
             )
 
-    def _finalize_cache_run(self, run_id: str) -> None:
+    def _finalize_cache_run(
+        self,
+        run_id: str,
+        *,
+        assistant_response: Any = None,
+    ) -> None:
         with self._lock, self._db() as db:
             run = db.execute(
                 "SELECT * FROM hermes_cache_runs WHERE run_id=?", (run_id,)
@@ -886,7 +1128,12 @@ class HermesControlAdapter:
         ]
         new_recipe: VerifiedActionRecipe | None = None
         if cache_status == "miss" and recipe is None:
-            new_recipe = self._new_recipe(run, action, measurement)
+            new_recipe = self._new_recipe(
+                run,
+                action,
+                measurement,
+                assistant_response if isinstance(assistant_response, str) else None,
+            )
             recipe = new_recipe
         if cache_status == "hit" and recipe is None:
             return
@@ -1128,6 +1375,7 @@ class HermesControlAdapter:
                 "message": "BLOCKED: CortexOps action is already final or unavailable",
             }
         args_hash = _hash(args)
+        replay_args = _safe_replay_args(args, self.config.redact_keys)
         try:
             cache_status, cache_match, cache_validation = self._cache_decision_for_call(
                 kw, tool, args_hash
@@ -1216,6 +1464,11 @@ class HermesControlAdapter:
                                 "args_hash": args_hash,
                                 "argument_keys": sorted(str(key) for key in args),
                                 "tool_descriptor": tool.as_dict(),
+                                **(
+                                    {"replay_args": replay_args}
+                                    if replay_args is not None
+                                    else {}
+                                ),
                             }
                         ),
                         state,
@@ -1733,6 +1986,7 @@ def register(ctx: Any) -> None:
         HermesControlConfig.from_settings({key: ctx.get_config(key) for key in keys})
     )
     ctx.register_hook("pre_llm_call", adapter.pre_llm_call)
+    ctx.register_hook("pre_model_completion", adapter.pre_model_completion)
     ctx.register_hook("post_api_request", adapter.post_api_request)
     ctx.register_hook("pre_tool_call", adapter.pre_tool_call)
     ctx.register_hook("post_tool_call", adapter.post_tool_call)

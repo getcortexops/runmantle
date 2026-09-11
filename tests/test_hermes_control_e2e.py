@@ -184,6 +184,7 @@ def test_plugin_registers_the_actual_hermes_hook_and_transport() -> None:
     register(context)
     assert set(context.hooks) == {
         "pre_llm_call",
+        "pre_model_completion",
         "post_api_request",
         "pre_tool_call",
         "post_tool_call",
@@ -192,7 +193,7 @@ def test_plugin_registers_the_actual_hermes_hook_and_transport() -> None:
     assert callable(context.transport)
 
 
-def test_hermes_first_run_is_measured_baseline_and_second_is_cache_reuse(
+def test_hermes_measured_baseline_then_verified_reuse_has_no_provider_usage(
     tmp_path: Path,
 ) -> None:
     from tests.test_cortexops_process_integration import (
@@ -208,7 +209,7 @@ def test_hermes_first_run_is_measured_baseline_and_second_is_cache_reuse(
             probe_base_url=probe_url,
         )
 
-        def run_turn(
+        def run_baseline_turn(
             *, task_id: str, run_id: str, call_id: str, tokens: tuple[int, int]
         ) -> dict[str, str] | None:
             common = {
@@ -261,7 +262,7 @@ def test_hermes_first_run_is_measured_baseline_and_second_is_cache_reuse(
             return context
 
         assert (
-            run_turn(
+            run_baseline_turn(
                 task_id="task-cache-baseline",
                 run_id="run-cache-baseline",
                 call_id="call-cache-baseline",
@@ -276,13 +277,74 @@ def test_hermes_first_run_is_measured_baseline_and_second_is_cache_reuse(
             tmp_path / "cache-adapter.sqlite",
             probe_base_url=probe_url,
         )
-        reused_context = run_turn(
-            task_id="task-cache-reuse",
-            run_id="run-cache-reuse",
-            call_id="call-cache-reuse",
-            tokens=(25, 10),
+        reuse_common = {
+            "task_id": "task-cache-reuse",
+            "session_id": "session-task-cache-reuse",
+            "turn_id": "run-cache-reuse",
+        }
+        assert adapter.pre_llm_call(
+            **reuse_common,
+            user_message="Deploy version two to the local service",
+        ) is not None
+        def dispatch_replay(
+            tool_name: str, args: dict[str, Any]
+        ) -> dict[str, str]:
+            call = {
+                **reuse_common,
+                "tool_name": tool_name,
+                "args": args,
+                "tool_call_id": "call-cache-reuse",
+            }
+            directive = adapter.pre_tool_call(**call)
+            assert directive and directive["action"] == "approve"
+            with adapter._db() as db:
+                approval = db.execute(
+                    "SELECT approval_id,action_hash FROM hermes_actions "
+                    "WHERE tool_call_id=?",
+                    (call["tool_call_id"],),
+                ).fetchone()
+            _operator_post(
+                base_url,
+                f"/api/runmantle/v1/approvals/{approval['approval_id']}/approve",
+                {
+                    "action_hash": approval["action_hash"],
+                    "idempotency_key": "operator-call-cache-reuse",
+                    "reason": "reviewed again",
+                },
+            )
+            assert adapter.present_approval(
+                _ApprovalRequest(call["tool_call_id"])
+            ) == "once"
+            adapter.post_tool_call(
+                **call,
+                status="ok",
+                result="deployed",
+                duration_ms=2,
+            )
+            return {"tool_call_id": call["tool_call_id"], "result": "deployed"}
+
+        completed = adapter.pre_model_completion(
+            **reuse_common,
+            user_message="Deploy version two to the local service",
+            dispatch_tool=dispatch_replay,
         )
-        assert reused_context is not None
+        assert completed == {
+            "complete_turn": True,
+            "response": "Deployment complete.",
+        }
+        with adapter._db() as db:
+            provider_usage_rows = db.execute(
+                "SELECT COUNT(*) FROM hermes_api_usage WHERE run_id=?",
+                (reuse_common["turn_id"],),
+            ).fetchone()[0]
+        assert provider_usage_rows == 0
+        # The shared Hermes finalizer still emits post_llm_call. Since the
+        # cache run was finalized by the verified replay, this is a no-op.
+        adapter.post_llm_call(
+            **reuse_common,
+            user_message="Deploy version two to the local service",
+            assistant_response=completed["response"],
+        )
 
         operator = UrllibCortexOpsControlTransport(
             base_url,
@@ -293,10 +355,11 @@ def test_hermes_first_run_is_measured_baseline_and_second_is_cache_reuse(
         )
         assert result["summary"]["runs"] == 2
         assert result["summary"]["cache_hit_rate"] == 0.5
-        assert result["summary"]["measured_tokens_saved"] == 65
+        assert result["summary"]["measured_tokens_saved"] == 100
         assert result["summary"]["verified_reuse_success_rate"] == 1
         runs = {item["run_id"]: item for item in result["runs"]}
         assert runs["run-cache-baseline"]["cache_status"] == "miss"
         assert runs["run-cache-baseline"]["baseline"]["kind"] == "measured"
         assert runs["run-cache-reuse"]["cache_status"] == "hit"
         assert runs["run-cache-reuse"]["reused"]["kind"] == "measured"
+        assert runs["run-cache-reuse"]["reused"]["total_tokens"] == 0
