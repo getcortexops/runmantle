@@ -33,6 +33,7 @@ from runmantle.evidence import (
 from runmantle.integrations.cortexops_control import (
     CortexOpsControlClient,
     CortexOpsControlError,
+    CortexOpsControlRejected,
     UrllibCortexOpsControlTransport,
     _digest,
 )
@@ -1008,6 +1009,38 @@ class HermesControlAdapter:
             },
         )
 
+    def _register_runtime_for(
+        self, tool: ToolDescriptor, *, force: bool = False
+    ) -> None:
+        """Ensure the control plane has the runtime's current capabilities.
+
+        A CortexOps workspace reset intentionally removes runtime registrations.
+        The Hermes process can outlive that reset, however, so its in-memory
+        handshake is no longer evidence that the control plane still knows the
+        runtime.  Registration is safe to refresh with the stable request ID.
+        """
+
+        if force:
+            self.client._handshake = None
+        if getattr(self.client, "_handshake", None):
+            return
+        capabilities = {
+            descriptor.capability
+            for descriptor in self.tool_inventory.snapshot()
+            if descriptor.side_effecting
+        }
+        capabilities.add(tool.capability)
+        capabilities.update({"govern.v2", "govern.receipt.v1"})
+        if self.config.verified_action_cache_enabled:
+            capabilities.add("verified_action_cache.telemetry.v1")
+        self.client.register_runtime(capabilities)
+
+    @staticmethod
+    def _requires_runtime_reregistration(error: CortexOpsControlRejected) -> bool:
+        """Return whether a rejected task registration proves a stale handshake."""
+
+        return "runmantle runtime is not registered" in str(error).lower()
+
     def pre_tool_call(self, **kw: Any) -> dict[str, str] | None:
         tool_name = str(kw.get("tool_name") or "")
         if not tool_name:
@@ -1108,18 +1141,14 @@ class HermesControlAdapter:
             expected_state=expected_state,
         )
         try:
-            if not getattr(self.client, "_handshake", None):
-                capabilities = {
-                    descriptor.capability
-                    for descriptor in self.tool_inventory.snapshot()
-                    if descriptor.side_effecting
-                }
-                capabilities.add(tool.capability)
-                capabilities.update({"govern.v2", "govern.receipt.v1"})
-                if self.config.verified_action_cache_enabled:
-                    capabilities.add("verified_action_cache.telemetry.v1")
-                self.client.register_runtime(capabilities)
-            self._register_task(contract, session_id)
+            self._register_runtime_for(tool)
+            try:
+                self._register_task(contract, session_id)
+            except CortexOpsControlRejected as error:
+                if not self._requires_runtime_reregistration(error):
+                    raise
+                self._register_runtime_for(tool, force=True)
+                self._register_task(contract, session_id)
             decision = self.client.evaluate_action(
                 request, correlation_id=session_id, worker_id="hermes"
             )

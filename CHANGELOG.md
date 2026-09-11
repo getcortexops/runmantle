@@ -6,6 +6,14 @@ All notable changes to Runmantle are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-09-11
+
+### Fixed
+
+- Hermes now refreshes its CortexOps runtime handshake after a workspace reset
+  removes the control-plane registration, then retries the task registration
+  once without weakening fail-closed behavior for other control rejections.
+
 ## [1.2.0] - 2026-09-11
 
 ### Added

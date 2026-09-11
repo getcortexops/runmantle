@@ -6,7 +6,10 @@ from typing import Any, cast
 from unittest.mock import patch
 
 from runmantle.actions import ActionRequest
-from runmantle.integrations.cortexops_control import CortexOpsControlError
+from runmantle.integrations.cortexops_control import (
+    CortexOpsControlError,
+    CortexOpsControlRejected,
+)
 from runmantle.integrations.hermes_control import (
     HermesControlAdapter,
     HermesControlConfig,
@@ -117,6 +120,29 @@ class _Client:
         return document
 
 
+class _ResetRecoveringClient(_Client):
+    """Simulate a process whose CortexOps workspace was reset mid-run."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_calls = 0
+        self.register_task_calls = 0
+
+    def register_runtime(self, *_: Any) -> dict[str, Any]:
+        self.register_calls += 1
+        self._handshake = {"policy": {}}
+        return self._handshake
+
+    def register_task(self, *_: Any, **__: Any) -> dict[str, Any]:
+        self.register_task_calls += 1
+        if self.register_task_calls == 1:
+            raise CortexOpsControlRejected(
+                "CortexOps control rejected request (404): "
+                "'Runmantle runtime is not registered'"
+            )
+        return {"ok": True}
+
+
 class _Request:
     def __init__(
         self, call_id: str = "c", request_id: str = "r1", digest: str = "digest"
@@ -164,6 +190,20 @@ def _assert_approval(adapter: HermesControlAdapter) -> None:
     result = adapter.pre_tool_call(**_call())
     assert result is not None
     assert result["action"] == "approve"
+
+
+def test_workspace_reset_reregisters_runtime_before_retrying_task(
+    tmp_path: Path,
+) -> None:
+    adapter, _ = _adapter(tmp_path)
+    client = _ResetRecoveringClient()
+    adapter.client = cast(Any, client)
+
+    result = adapter.pre_tool_call(**_call())
+
+    assert result and result["action"] == "approve"
+    assert client.register_calls == 1
+    assert client.register_task_calls == 2
 
 
 def test_approved_dispatches_once_and_is_request_bound(tmp_path: Path) -> None:
