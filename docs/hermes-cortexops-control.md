@@ -28,6 +28,8 @@ plugins:
         approval_timeout_seconds: 300
         approval_poll_initial_seconds: 0.25
         approval_poll_max_seconds: 2
+        # Required: do not poll CortexOps from Hermes's short-lived hook.
+        blocking_hook_approval: false
         # Optional overrides; discovery does not require a tool list.
         classification_overrides:
           terminal:
@@ -97,12 +99,12 @@ databases, and combined audit trace below
 loopback URL recorded as `cortexops_url` in each scenario trace and is stopped
 when the proof completes.
 
-Hermes v0.20.5 does not apply a selected approval transport to an `approve`
-directive returned by `pre_tool_call`; that path opens its built-in prompt.
-The demo therefore enables `blocking_hook_approval: true`. In this compatibility
-mode the RunMantle hook blocks the same Hermes tool call while it polls the real
-CortexOps pending approval, validates the exact action permit, consumes it once,
-and only then returns control to Hermes. No inter-service response is mocked.
+Hermes routes an `approve` directive returned by `pre_tool_call` through the
+selected `security.approval.transport`. Keep `blocking_hook_approval: false` so
+the hook returns immediately and Hermes owns the user-facing wait. The CortexOps
+transport then polls its authoritative pending approval, validates the exact
+action permit, consumes it once, and only then allows the tool to execute. No
+inter-service response is mocked.
 
 Troubleshooting:
 

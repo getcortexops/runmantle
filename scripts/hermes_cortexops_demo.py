@@ -395,7 +395,9 @@ plugins:
         approval_timeout_seconds: 60
         approval_poll_initial_seconds: 0.05
         approval_poll_max_seconds: 0.25
-        blocking_hook_approval: true
+        # Hermes owns the user-facing approval wait. The RunMantle pre-tool
+        # hook must return immediately with the approval directive.
+        blocking_hook_approval: false
         classification_overrides:
           terminal:
             action_name: local-deployment
