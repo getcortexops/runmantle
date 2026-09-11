@@ -6,6 +6,13 @@ All notable changes to Runmantle are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-09-11
+
+### Fixed
+
+- CortexOps runtime confirmations now reference their audited execution receipt
+  in `evidence_ids` while preserving independent provider evidence identifiers.
+
 ## [1.1.1] - 2026-09-09
 
 ### Added

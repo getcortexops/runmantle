@@ -583,6 +583,10 @@ class CortexOpsControlLoopIntegrationTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row[0], "confirmed")
             self.assertEqual(row[1], f"{control.runtime_id}:{receipt.receipt_id}")
             self.assertIn("runtime-health", row[2])
+            self.assertIn(
+                f"{control.runtime_id}:{receipt.receipt_id}",
+                row[2],
+            )
 
     async def test_recognized_block_never_invokes_handler(self) -> None:
         with TemporaryDirectory() as directory:

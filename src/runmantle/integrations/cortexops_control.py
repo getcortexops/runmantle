@@ -364,6 +364,18 @@ class CortexOpsControlClient:
     ) -> dict[str, Any]:
         """Submit independent target observation; this is not a receipt claim."""
 
+        receipt_id = f"{self.runtime_id}:{confirmation.receipt_id}"
+        # CortexOps binds an independent observation to the already-audited
+        # execution receipt.  Preserve the provider's evidence alongside that
+        # receipt reference; neither is outcome verification evidence.
+        evidence_ids = [
+            receipt_id,
+            *(
+                item.evidence_id
+                for item in confirmation.evidence
+                if item.evidence_id != receipt_id
+            ),
+        ]
         return self._request(
             "POST",
             f"/actions/{decision['decision_id']}/runtime-confirmations",
@@ -376,13 +388,13 @@ class CortexOpsControlClient:
                 "task_id": confirmation.task_id,
                 "action_id": confirmation.action_id,
                 "action_hash": confirmation.action_hash,
-                "receipt_id": f"{self.runtime_id}:{confirmation.receipt_id}",
+                "receipt_id": receipt_id,
                 "confirmation_id": confirmation.confirmation_id,
                 "status": confirmation.status.value,
                 "provider_id": confirmation.provider_id,
                 "observed_state": dict(confirmation.observed_state),
                 "expected_state": dict(confirmation.expected_state),
-                "evidence_ids": [item.evidence_id for item in confirmation.evidence],
+                "evidence_ids": evidence_ids,
                 "checked_at": confirmation.checked_at.isoformat(),
                 "actor": confirmation.actor,
             },
