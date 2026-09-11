@@ -168,6 +168,7 @@ def _adapter(
             "approval_timeout_seconds": options.pop("approval_timeout_seconds", 0.02),
             "approval_poll_initial_seconds": 0.001,
             "approval_poll_max_seconds": 0.002,
+            "post_action_probes": options.pop("post_action_probes", {}),
         }
     )
     adapter = HermesControlAdapter(config)
@@ -204,6 +205,41 @@ def test_workspace_reset_reregisters_runtime_before_retrying_task(
     assert result and result["action"] == "approve"
     assert client.register_calls == 1
     assert client.register_task_calls == 2
+
+
+def test_capability_filesystem_probe_verifies_any_matching_tool(tmp_path: Path) -> None:
+    target = tmp_path / "result.txt"
+    target.write_text("verified content")
+    adapter, _ = _adapter(
+        tmp_path,
+        post_action_probes={
+            "capability:terminal.deploy": {
+                "kind": "filesystem_content",
+                "path_argument": "path",
+                "content_argument": "content",
+            }
+        },
+    )
+    call = _call()
+    call["args"] = {"path": str(target), "content": "verified content"}
+    directive = adapter.pre_tool_call(**call)
+    assert directive and directive["action"] == "approve"
+    with adapter._db() as db:
+        db.execute(
+            "UPDATE hermes_actions SET state='dispatched' WHERE tool_call_id=?",
+            (call["tool_call_id"],),
+        )
+
+    adapter.post_tool_call(**call, status="ok", result="written", duration_ms=1)
+
+    with adapter._db() as db:
+        row = db.execute(
+            "SELECT confirmation_delivered,verification_status FROM hermes_actions "
+            "WHERE tool_call_id=?",
+            (call["tool_call_id"],),
+        ).fetchone()
+    assert row["confirmation_delivered"] == 1
+    assert row["verification_status"] == "verified"
 
 
 def test_approved_dispatches_once_and_is_request_bound(tmp_path: Path) -> None:

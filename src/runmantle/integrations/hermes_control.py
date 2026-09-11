@@ -720,8 +720,7 @@ class HermesControlAdapter:
             kind=CacheMatchKind(str(run["match_type"])),
             score=float(run["match_confidence"]),
         )
-        probe = self.config.post_action_probes.get(tool.name)
-        probe_material = probe if isinstance(probe, Mapping) else {}
+        probe_material = self._probe_for(tool.name, tool.capability)
         validation = tuple(
             _HermesRecipePreconditionValidator(
                 tool=tool,
@@ -774,8 +773,9 @@ class HermesControlAdapter:
         request = json.loads(action["request_json"])
         descriptor = request["tool_descriptor"]
         tool_name = str(descriptor["name"])
-        probe = self.config.post_action_probes.get(tool_name)
-        probe_material = probe if isinstance(probe, Mapping) else {}
+        probe_material = self._probe_for(
+            tool_name, str(descriptor.get("capability") or "")
+        )
         evidence = json.loads(action["evidence_json"])
         recipe_id = "hermes:" + _hash(
             {
@@ -1035,6 +1035,44 @@ class HermesControlAdapter:
             capabilities.add("verified_action_cache.telemetry.v1")
         self.client.register_runtime(capabilities)
 
+    def _probe_for(self, tool_name: str, capability: str) -> Mapping[str, Any]:
+        """Resolve a probe by exact tool name, capability, or safe default."""
+
+        probes = self.config.post_action_probes or {}
+        for key in (tool_name, f"capability:{capability}", "*"):
+            probe = probes.get(key)
+            if isinstance(probe, Mapping):
+                return probe
+        return {}
+
+    @staticmethod
+    def _filesystem_expected_state(
+        probe: Mapping[str, Any], args: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        path_key = str(probe.get("path_argument") or "path")
+        content_key = str(probe.get("content_argument") or "content")
+        path, content = args.get(path_key), args.get(content_key)
+        if not isinstance(path, str) or not isinstance(content, str):
+            raise ValueError(
+                "filesystem probe requires string path and content arguments"
+            )
+        encoded = content.encode("utf-8")
+        return {
+            "file": {
+                "path_hash": _hash({"path": path}),
+                "content_sha256": hashlib.sha256(encoded).hexdigest(),
+                "byte_length": len(encoded),
+            }
+        }
+
+    def _expected_state_for_probe(
+        self, probe: Mapping[str, Any], args: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        if str(probe.get("kind") or "http") == "filesystem_content":
+            return self._filesystem_expected_state(probe, args)
+        expected = probe.get("expected_state")
+        return dict(expected) if isinstance(expected, Mapping) else {}
+
     @staticmethod
     def _requires_runtime_reregistration(error: CortexOpsControlRejected) -> bool:
         """Return whether a rejected task registration proves a stale handshake."""
@@ -1127,12 +1165,11 @@ class HermesControlAdapter:
                 "tool_descriptor": tool.as_dict(),
             },
         )
-        probe = self.config.post_action_probes.get(tool_name)
-        expected_state: Mapping[str, Any] = {}
-        if isinstance(probe, Mapping):
-            configured_expected = probe.get("expected_state")
-            if isinstance(configured_expected, Mapping):
-                expected_state = configured_expected
+        probe = self._probe_for(tool.name, tool.capability)
+        try:
+            expected_state = self._expected_state_for_probe(probe, args)
+        except (TypeError, ValueError):
+            expected_state = {}
         contract = hermes_task_contract(
             task_id,
             session_id,
@@ -1497,29 +1534,55 @@ class HermesControlAdapter:
     def _send_probe(
         self, row: sqlite3.Row, kw: Mapping[str, Any]
     ) -> _HermesProbeVerification | None:
-        probe = (self.config.post_action_probes or {}).get(
-            str(kw.get("tool_name") or "")
+        request_data = json.loads(row["request_json"])
+        descriptor = request_data.get("tool_descriptor") or {}
+        probe = self._probe_for(
+            str(kw.get("tool_name") or ""), str(descriptor.get("capability") or "")
         )
-        if not isinstance(probe, Mapping):
+        if not probe:
             # An executor success without fresh outcome evidence is not verified.
             return None
         observed: dict[str, Any] = {}
-        expected = dict(probe.get("expected_state") or {})
+        raw_args = kw.get("args")
+        args = raw_args if isinstance(raw_args, Mapping) else {}
+        try:
+            expected = dict(self._expected_state_for_probe(probe, args))
+        except (TypeError, ValueError):
+            return None
         if not expected:
             return None
-        status = "confirmed"
+        kind = str(probe.get("kind") or "http")
+        provider_id = "runmantle.hermes.http_probe"
         try:
-            for label in ("version_url", "health_url"):
-                url = probe.get(label)
-                if not isinstance(url, str) or not url:
-                    raise ValueError(f"missing {label}")
-                with urlopen(
-                    Request(url, headers={"Accept": "application/json"}),
-                    timeout=self.config.decision_timeout_seconds,
-                ) as response:
-                    observed[label.removesuffix("_url")] = json.loads(response.read())
-            if observed != expected:
-                status = "failed"
+            if kind == "filesystem_content":
+                path_key = str(probe.get("path_argument") or "path")
+                path = args.get(path_key)
+                if not isinstance(path, str):
+                    raise ValueError("filesystem probe requires a string path")
+                content = Path(path).read_bytes()
+                observed = {
+                    "file": {
+                        "path_hash": _hash({"path": path}),
+                        "content_sha256": hashlib.sha256(content).hexdigest(),
+                        "byte_length": len(content),
+                    }
+                }
+                provider_id = "runmantle.hermes.filesystem_probe"
+            elif kind == "http":
+                for label in ("version_url", "health_url"):
+                    url = probe.get(label)
+                    if not isinstance(url, str) or not url:
+                        raise ValueError(f"missing {label}")
+                    with urlopen(
+                        Request(url, headers={"Accept": "application/json"}),
+                        timeout=self.config.decision_timeout_seconds,
+                    ) as response:
+                        observed[label.removesuffix("_url")] = json.loads(
+                            response.read()
+                        )
+            else:
+                return None
+            status = "confirmed" if observed == expected else "failed"
         except Exception as error:  # noqa: BLE001 - probes are non-authoritative evidence
             status, observed = "inconclusive", {"probe_error": type(error).__name__}
         receipt = json.loads(row["receipt_json"]) if row["receipt_json"] else {}
@@ -1539,7 +1602,7 @@ class HermesControlAdapter:
             ),
             "confirmation_id": f"hermes:{row['tool_call_id']}:probe",
             "status": status,
-            "provider_id": "runmantle.hermes.http_probe",
+            "provider_id": provider_id,
             "observed_state": observed,
             "expected_state": expected,
             "evidence_ids": [
@@ -1550,8 +1613,6 @@ class HermesControlAdapter:
             "checked_at": checked_at,
             "actor": "runmantle.hermes_control",
         }
-        request_data = json.loads(row["request_json"])
-        descriptor = request_data.get("tool_descriptor") or {}
         try:
             contract = hermes_task_contract(
                 str(kw.get("task_id") or ""),
@@ -1564,13 +1625,16 @@ class HermesControlAdapter:
                 EvidenceItem(
                     evidence_id=f"hermes:{row['tool_call_id']}:runtime-probe",
                     type="hermes_tool_runtime",
-                    source="runmantle.hermes.http_probe",
+                    source=provider_id,
                     collected_at=datetime.fromisoformat(checked_at),
                     payload=observed,
                 ),
                 boundary="runmantle.hermes_control.post_action_probe",
-                provider_identity="runmantle.hermes.http_probe:v1",
+                provider_identity=f"{provider_id}:v1",
                 provider_configuration={
+                    "kind": kind,
+                    "path_argument": str(probe.get("path_argument") or ""),
+                    "content_argument": str(probe.get("content_argument") or ""),
                     "version_url": str(probe.get("version_url") or ""),
                     "health_url": str(probe.get("health_url") or ""),
                     "expected_state_hash": _hash({"expected": expected}),

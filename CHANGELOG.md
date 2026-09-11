@@ -6,6 +6,14 @@ All notable changes to Runmantle are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-09-11
+
+### Added
+
+- capability-scoped post-action probes for Hermes, including a generic
+  `filesystem_content` probe that reads the action's own path back and compares
+  content hashes without storing the content in telemetry.
+
 ## [1.2.1] - 2026-09-11
 
 ### Fixed
