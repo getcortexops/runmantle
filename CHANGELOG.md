@@ -6,6 +6,23 @@ All notable changes to Runmantle are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-12
+
+### Added
+
+- deterministic parameterized verified recipes for Hermes: safe JSON argument
+  values may change when they appear verbatim in a fully matching user request,
+  while every replay still repeats policy, approval, dispatch, receipt, runtime
+  confirmation, and independent verification;
+- provider, resolved-model, and measured-cost metadata on verified-cache
+  baselines and reuses when Hermes makes that non-content usage data available.
+
+### Fixed
+
+- cache telemetry now retries without additive model and cost metadata when a
+  temporarily older CortexOps API rejects those optional fields, so a verified
+  baseline is not lost during a staggered upgrade.
+
 ## [1.2.2] - 2026-09-11
 
 ### Added
