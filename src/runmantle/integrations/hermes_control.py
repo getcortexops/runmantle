@@ -1038,9 +1038,10 @@ class HermesControlAdapter:
                     "the requested outcome."
                 )
             else:
-                replay_args = _safe_replay_args(raw_args, self.config.redact_keys)
-                if replay_args is None:
+                exact_replay_args = _safe_replay_args(raw_args, self.config.redact_keys)
+                if exact_replay_args is None:
                     return None
+                replay_args = exact_replay_args
             tool = self._tool(tool_name)
             cache_status, match, validation = self._cache_decision_for_call(
                 kw,

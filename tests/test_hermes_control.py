@@ -753,7 +753,7 @@ def test_missing_recipe_source_discards_stale_recipe_before_replay(
             input_tokens=80,
             output_tokens=20,
         )
-        client.transport.request = lambda method, path, payload=None: (
+        cast(Any, client.transport).request = lambda method, path, payload=None: (
             {"verified_status": "verified"}
             if path == "/api/runmantle/v1/tasks/status"
             else (_ for _ in ()).throw(CortexOpsControlRejected("source missing"))

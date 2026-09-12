@@ -315,7 +315,7 @@ def test_hermes_measured_baseline_then_verified_reuse_has_no_provider_usage(
                 },
             )
             assert (
-                adapter.present_approval(_ApprovalRequest(call["tool_call_id"]))
+                adapter.present_approval(_ApprovalRequest(str(call["tool_call_id"])))
                 == "once"
             )
             adapter.post_tool_call(
@@ -324,7 +324,7 @@ def test_hermes_measured_baseline_then_verified_reuse_has_no_provider_usage(
                 result="deployed",
                 duration_ms=2,
             )
-            return {"tool_call_id": call["tool_call_id"], "result": "deployed"}
+            return {"tool_call_id": str(call["tool_call_id"]), "result": "deployed"}
 
         completed = adapter.pre_model_completion(
             **reuse_common,
