@@ -9,6 +9,8 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import math
+import re
 import shutil
 import sqlite3
 import threading
@@ -128,6 +130,144 @@ def _safe_replay_args(
     if not isinstance(decoded, dict) or decoded != plain:
         return None
     return decoded
+
+
+def _safe_usage_metadata(value: Any) -> str | None:
+    """Keep only bounded, content-free model-cost metadata from Hermes hooks."""
+
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value[:256] if value else None
+
+
+_PARAMETER_KEY = "$runmantle_parameter"
+
+
+def _string_leaves(value: Any) -> tuple[str, ...]:
+    """Return distinct, non-empty JSON string leaves in stable order."""
+
+    leaves: list[str] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, str) and item:
+            leaves.append(item)
+        elif isinstance(item, Mapping):
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, list | tuple):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return tuple(dict.fromkeys(leaves))
+
+
+def _parameterized_recipe(
+    intent: str, args: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Make a local, deterministic template from safe arguments in a request.
+
+    The template never infers an argument: every substituted value must occur
+    verbatim in the original user request, and the resulting template must
+    later match the entire new request.  It is therefore safe to use before a
+    model call while still permitting changed paths, IDs, content, and other
+    JSON argument values for any governed Hermes tool.
+    """
+
+    if len(intent) > 100_000:
+        return None
+    candidates = tuple(
+        value
+        for value in _string_leaves(args)
+        if len(value) <= 50_000 and value in intent
+    )
+    if not candidates:
+        return None
+    names = {value: f"p{index}" for index, value in enumerate(candidates)}
+    ordered = tuple(sorted(candidates, key=lambda value: (-len(value), value)))
+    segments: list[dict[str, str]] = []
+    cursor = 0
+    while cursor < len(intent):
+        choices = [
+            (intent.find(value, cursor), value)
+            for value in ordered
+            if intent.find(value, cursor) >= 0
+        ]
+        if not choices:
+            segments.append({"literal": intent[cursor:]})
+            break
+        position, value = min(choices, key=lambda item: (item[0], -len(item[1])))
+        if position > cursor:
+            segments.append({"literal": intent[cursor:position]})
+        segments.append({"parameter": names[value]})
+        cursor = position + len(value)
+    if cursor == len(intent):
+        segments.append({"literal": ""})
+
+    def parameterize(item: Any) -> Any:
+        if isinstance(item, str) and item in names:
+            return {_PARAMETER_KEY: names[item]}
+        if isinstance(item, Mapping):
+            return {str(key): parameterize(child) for key, child in item.items()}
+        if isinstance(item, list | tuple):
+            return [parameterize(child) for child in item]
+        return item
+
+    args_template = parameterize(args)
+    if not isinstance(args_template, dict):
+        return None
+    return {
+        "intent_segments": segments,
+        "args_template": args_template,
+        "args_template_hash": _hash({"args_template": args_template}),
+    }
+
+
+def _parameter_values(
+    intent_segments: Any, intent: str
+) -> dict[str, str] | None:
+    if not isinstance(intent_segments, (list, tuple)) or not intent_segments:
+        return None
+    pattern: list[str] = ["^"]
+    seen: set[str] = set()
+    for segment in intent_segments:
+        if not isinstance(segment, Mapping) or len(segment) != 1:
+            return None
+        literal = segment.get("literal")
+        parameter = segment.get("parameter")
+        if isinstance(literal, str):
+            pattern.append(re.escape(literal))
+        elif isinstance(parameter, str) and re.fullmatch(r"p[0-9]+", parameter):
+            if parameter in seen:
+                pattern.append(f"(?P={parameter})")
+            else:
+                pattern.append(f"(?P<{parameter}>.+?)")
+                seen.add(parameter)
+        else:
+            return None
+    pattern.append("$")
+    try:
+        match = re.fullmatch("".join(pattern), intent, flags=re.DOTALL)
+    except re.error:
+        return None
+    if match is None:
+        return None
+    values = {name: value for name, value in match.groupdict().items() if value}
+    return values or None
+
+
+def _bind_parameterized_value(value: Any, values: Mapping[str, str]) -> Any:
+    if isinstance(value, Mapping):
+        if set(value) == {_PARAMETER_KEY} and isinstance(value[_PARAMETER_KEY], str):
+            return values.get(value[_PARAMETER_KEY])
+        return {
+            str(key): _bind_parameterized_value(item, values)
+            for key, item in value.items()
+        }
+    if isinstance(value, list | tuple):
+        return [_bind_parameterized_value(item, values) for item in value]
+    return value
 
 
 def _expected_leaves(
@@ -297,6 +437,7 @@ class _HermesRecipePreconditionValidator:
     tool: ToolDescriptor
     args_hash: str
     probe_hash: str
+    args_template_hash: str | None = None
 
     def validate(
         self, recipe: VerifiedActionRecipe, request: ReuseRequest
@@ -322,8 +463,13 @@ class _HermesRecipePreconditionValidator:
             ),
             (
                 "arguments",
-                expected.get("args_hash") == self.args_hash,
-                "the current redacted argument identity matches the recipe",
+                expected.get("args_hash") == self.args_hash
+                or (
+                    self.args_template_hash is not None
+                    and expected.get("args_template_hash")
+                    == self.args_template_hash
+                ),
+                "the current argument identity or verified template matches the recipe",
             ),
             (
                 "verification_probe",
@@ -463,6 +609,12 @@ class HermesControlAdapter:
                 output_tokens INTEGER NOT NULL DEFAULT 0,
                 duration_ms INTEGER NOT NULL DEFAULT 0,
                 usage_observed INTEGER NOT NULL DEFAULT 0,
+                estimated_cost_usd REAL,
+                cost_complete INTEGER NOT NULL DEFAULT 1,
+                provider TEXT,
+                model TEXT,
+                cost_status TEXT,
+                cost_source TEXT,
                 lookup_completed INTEGER NOT NULL DEFAULT 0,
                 finalized INTEGER NOT NULL DEFAULT 0)""")
             db.execute("""CREATE TABLE IF NOT EXISTS hermes_api_usage (
@@ -470,7 +622,37 @@ class HermesControlAdapter:
                 run_id TEXT NOT NULL,
                 input_tokens INTEGER NOT NULL,
                 output_tokens INTEGER NOT NULL,
-                duration_ms INTEGER NOT NULL)""")
+                duration_ms INTEGER NOT NULL,
+                estimated_cost_usd REAL,
+                provider TEXT,
+                model TEXT,
+                cost_status TEXT,
+                cost_source TEXT)""")
+            for table, columns in {
+                "hermes_cache_runs": {
+                    "estimated_cost_usd": "REAL",
+                    "cost_complete": "INTEGER NOT NULL DEFAULT 1",
+                    "provider": "TEXT",
+                    "model": "TEXT",
+                    "cost_status": "TEXT",
+                    "cost_source": "TEXT",
+                },
+                "hermes_api_usage": {
+                    "estimated_cost_usd": "REAL",
+                    "provider": "TEXT",
+                    "model": "TEXT",
+                    "cost_status": "TEXT",
+                    "cost_source": "TEXT",
+                },
+            }.items():
+                existing_columns = {
+                    str(row[1]) for row in db.execute(f"PRAGMA table_info({table})")
+                }
+                for column, declaration in columns.items():
+                    if column not in existing_columns:
+                        db.execute(
+                            f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+                        )
             db.execute("""CREATE TABLE IF NOT EXISTS hermes_verified_recipes (
                 recipe_id TEXT PRIMARY KEY,
                 recipe_json TEXT NOT NULL,
@@ -572,6 +754,48 @@ class HermesControlAdapter:
                 # A malformed persisted recipe is never eligible for reuse.
                 continue
 
+    def _parameterized_match(self, intent: str) -> CacheMatch | None:
+        """Find a fully deterministic variable binding for a verified recipe."""
+
+        for recipe in self._cache.recipes():
+            strategy = recipe.execution_strategy.get("parameterized_replay")
+            if not isinstance(strategy, Mapping):
+                continue
+            values = _parameter_values(strategy.get("intent_segments"), intent)
+            template = strategy.get("args_template")
+            if values is None or not isinstance(template, Mapping):
+                continue
+            bound = _bind_parameterized_value(template, values)
+            if not isinstance(bound, Mapping):
+                continue
+            if _safe_replay_args(bound, self.config.redact_keys) is None:
+                continue
+            from runmantle.verified_action_cache import CacheMatchKind
+
+            return CacheMatch(recipe, CacheMatchKind.PARAMETERIZED, 1.0)
+        return None
+
+    def _parameterized_replay_args(
+        self, recipe: VerifiedActionRecipe, intent: str
+    ) -> tuple[dict[str, Any], str] | None:
+        strategy = recipe.execution_strategy.get("parameterized_replay")
+        if not isinstance(strategy, Mapping):
+            return None
+        values = _parameter_values(strategy.get("intent_segments"), intent)
+        template = strategy.get("args_template")
+        template_hash = strategy.get("args_template_hash")
+        if (
+            values is None
+            or not isinstance(template, Mapping)
+            or not isinstance(template_hash, str)
+        ):
+            return None
+        bound = _bind_parameterized_value(template, values)
+        if not isinstance(bound, Mapping):
+            return None
+        safe_args = _safe_replay_args(bound, self.config.redact_keys)
+        return (safe_args, template_hash) if safe_args is not None else None
+
     def pre_llm_call(self, **kw: Any) -> dict[str, str] | None:
         """Look up a verified strategy before Hermes plans the current turn."""
 
@@ -599,6 +823,10 @@ class HermesControlAdapter:
                     relevant_inputs={},
                 )
                 match = self._cache.lookup(request)
+                if match is None or match.kind.value == "similar":
+                    parameterized = self._parameterized_match(intent)
+                    if parameterized is not None:
+                        match = parameterized
                 db.execute(
                     "INSERT INTO hermes_cache_runs("
                     "run_id,task_id,session_id,turn_id,task_intent,"
@@ -651,7 +879,7 @@ class HermesControlAdapter:
         }
 
     def post_api_request(self, **kw: Any) -> None:
-        """Accumulate only provider-reported Hermes token usage for this run."""
+        """Accumulate Hermes usage plus safe, provider-derived cost metadata."""
 
         if not self.config.verified_action_cache_enabled:
             return
@@ -669,30 +897,68 @@ class HermesControlAdapter:
             input_tokens = int(str(raw_input_tokens))
             output_tokens = int(str(usage.get("output_tokens") or 0))
             duration_ms = max(0, round(float(kw.get("api_duration") or 0) * 1000))
+            raw_cost = usage.get("estimated_cost_usd", usage.get("cost_usd"))
+            estimated_cost_usd = None if raw_cost is None else float(raw_cost)
         except (TypeError, ValueError):
             return
-        if input_tokens < 0 or output_tokens < 0:
+        if (
+            input_tokens < 0
+            or output_tokens < 0
+            or (
+                estimated_cost_usd is not None
+                and (estimated_cost_usd < 0 or not math.isfinite(estimated_cost_usd))
+            )
+        ):
             return
+        provider = _safe_usage_metadata(kw.get("provider"))
+        model = _safe_usage_metadata(kw.get("response_model") or kw.get("model"))
+        cost_status = _safe_usage_metadata(usage.get("cost_status"))
+        cost_source = _safe_usage_metadata(usage.get("cost_source"))
         with self._lock, self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             inserted = db.execute(
                 "INSERT OR IGNORE INTO hermes_api_usage("
-                "api_request_id,run_id,input_tokens,output_tokens,duration_ms"
-                ") VALUES(?,?,?,?,?)",
+                "api_request_id,run_id,input_tokens,output_tokens,duration_ms,"
+                "estimated_cost_usd,provider,model,cost_status,cost_source"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
                     api_request_id,
                     run_id,
                     input_tokens,
                     output_tokens,
                     duration_ms,
+                    estimated_cost_usd,
+                    provider,
+                    model,
+                    cost_status,
+                    cost_source,
                 ),
             ).rowcount
             if inserted:
                 db.execute(
                     "UPDATE hermes_cache_runs SET "
                     "input_tokens=input_tokens+?,output_tokens=output_tokens+?,"
-                    "duration_ms=duration_ms+?,usage_observed=1 WHERE run_id=?",
-                    (input_tokens, output_tokens, duration_ms, run_id),
+                    "duration_ms=duration_ms+?,usage_observed=1,"
+                    "estimated_cost_usd=CASE WHEN ? IS NULL THEN estimated_cost_usd "
+                    "ELSE COALESCE(estimated_cost_usd, 0)+? END,"
+                    "cost_complete=CASE WHEN ? IS NULL THEN 0 ELSE cost_complete END,"
+                    "provider=COALESCE(provider, ?),model=COALESCE(model, ?),"
+                    "cost_status=COALESCE(cost_status, ?),"
+                    "cost_source=COALESCE(cost_source, ?) "
+                    "WHERE run_id=?",
+                    (
+                        input_tokens,
+                        output_tokens,
+                        duration_ms,
+                        estimated_cost_usd,
+                        estimated_cost_usd,
+                        estimated_cost_usd,
+                        provider,
+                        model,
+                        cost_status,
+                        cost_source,
+                        run_id,
+                    ),
                 )
 
     def post_llm_call(self, **kw: Any) -> None:
@@ -727,14 +993,24 @@ class HermesControlAdapter:
                 run = db.execute(
                     "SELECT * FROM hermes_cache_runs WHERE run_id=?", (run_id,)
                 ).fetchone()
+            match_type = str(run["match_type"] or "") if run is not None else ""
             if (
                 run is None
-                or str(run["match_type"] or "") != "exact"
+                or match_type not in {"exact", "parameterized"}
                 or not run["candidate_recipe_id"]
             ):
                 return None
             recipe = self._recipe_by_id(str(run["candidate_recipe_id"]))
             if recipe is None or not recipe.successful or not recipe.verified:
+                return None
+            if not self._recipe_source_is_available(recipe):
+                # A workspace reset can leave the local cache intact while
+                # deleting the measured baseline that makes its savings
+                # claim auditable. Do not replay such a recipe. Removing it
+                # makes this turn's ordinary model path create a new measured
+                # baseline for the current workspace instead of repeatedly
+                # producing an unfinalized local hit.
+                self._discard_recipe(recipe.recipe_id)
                 return None
             replay = recipe.execution_strategy.get("replay")
             if not isinstance(replay, Mapping):
@@ -752,19 +1028,33 @@ class HermesControlAdapter:
                 or recipe.tool_capability_sequence[0].tool != tool_name
             ):
                 return None
-            replay_args = _safe_replay_args(raw_args, self.config.redact_keys)
-            if replay_args is None:
-                return None
+            template_hash = None
+            if match_type == "parameterized":
+                parameterized = self._parameterized_replay_args(
+                    recipe, str(run["task_intent"])
+                )
+                if parameterized is None:
+                    return None
+                replay_args, template_hash = parameterized
+                final_response = (
+                    "Completed the governed action and independently verified "
+                    "the requested outcome."
+                )
+            else:
+                replay_args = _safe_replay_args(raw_args, self.config.redact_keys)
+                if replay_args is None:
+                    return None
             tool = self._tool(tool_name)
             cache_status, match, validation = self._cache_decision_for_call(
                 kw,
                 tool,
                 _hash(replay_args),
+                args_template_hash=template_hash,
             )
             if (
                 cache_status != "hit"
                 or match is None
-                or match.kind.value != "exact"
+                or match.kind.value != match_type
                 or match.recipe.recipe_id != recipe.recipe_id
                 or not validation
                 or not all(item.passed for item in validation)
@@ -782,9 +1072,9 @@ class HermesControlAdapter:
                     "SELECT * FROM hermes_actions WHERE tool_call_id=? AND run_id=?",
                     (tool_call_id, run_id),
                 ).fetchone()
-            if not self._verified_replay_action(action, recipe):
+            if not self._verified_replay_action(action, recipe, match_type):
                 return None
-            if not self._record_pre_model_reuse(run, action, recipe):
+            if not self._record_pre_model_reuse(run, action, recipe, match_type):
                 return None
             return {"complete_turn": True, "response": final_response}
         except (
@@ -799,10 +1089,38 @@ class HermesControlAdapter:
         ):
             return None
 
+    def _recipe_source_is_available(self, recipe: VerifiedActionRecipe) -> bool:
+        """Check that CortexOps still retains this recipe's verified source."""
+
+        try:
+            response = self.client.transport.request(
+                "GET",
+                "/api/runmantle/v1/tasks/"
+                f"{self.config.runtime_id}/{recipe.source_task_id}",
+            )
+        except CortexOpsControlError:
+            return False
+        return response.get("verified_status") == "verified"
+
+    def _discard_recipe(self, recipe_id: str) -> None:
+        """Remove a stale recipe from durable and in-memory lookup state."""
+
+        with self._lock, self._db() as db:
+            db.execute(
+                "DELETE FROM hermes_verified_recipes WHERE recipe_id=?", (recipe_id,)
+            )
+            db.execute(
+                "UPDATE hermes_cache_runs SET candidate_recipe_id=NULL,"
+                "match_type=NULL,match_confidence=NULL WHERE candidate_recipe_id=?",
+                (recipe_id,),
+            )
+        self._cache.discard(recipe_id)
+
     @staticmethod
     def _verified_replay_action(
         action: sqlite3.Row | None,
         recipe: VerifiedActionRecipe,
+        match_type: str,
     ) -> bool:
         if action is None:
             return False
@@ -810,7 +1128,7 @@ class HermesControlAdapter:
             action["state"] != "executed"
             or action["cache_status"] != "hit"
             or action["recipe_id"] != recipe.recipe_id
-            or action["match_type"] != "exact"
+            or action["match_type"] != match_type
             or not action["receipt_json"]
             or not action["receipt_delivered"]
             or not action["confirmation_delivered"]
@@ -838,6 +1156,7 @@ class HermesControlAdapter:
         run: sqlite3.Row,
         action: sqlite3.Row,
         recipe: VerifiedActionRecipe,
+        match_type: str,
     ) -> bool:
         """Emit measured zero-token reuse telemetry after fresh verification."""
 
@@ -853,13 +1172,18 @@ class HermesControlAdapter:
             duration_ms = max(0, int(receipt.get("duration_ms") or 0))
         except (TypeError, ValueError, json.JSONDecodeError):
             return False
-        reused = {
+        reused: dict[str, Any] = {
             "input_tokens": 0,
             "output_tokens": 0,
             "total_tokens": 0,
             "duration_ms": duration_ms,
             "kind": "measured",
         }
+        if baseline.get("estimated_cost_usd") is not None:
+            reused["estimated_cost_usd"] = 0.0
+        for metadata_key in ("provider", "model", "cost_status", "cost_source"):
+            if baseline.get(metadata_key) is not None:
+                reused[metadata_key] = baseline[metadata_key]
         payload = {
             "message_id": f"hermes:{run['run_id']}:verified-action-cache",
             "runtime_id": self.config.runtime_id,
@@ -869,7 +1193,7 @@ class HermesControlAdapter:
             "receipt_id": str(receipt["receipt_id"]),
             "cache_status": "hit",
             "recipe_id": recipe.recipe_id,
-            "match_type": "exact",
+            "match_type": match_type,
             "match_confidence": 1.0,
             "validation_result": "verified",
             "fallback_reason": None,
@@ -881,9 +1205,7 @@ class HermesControlAdapter:
             "recipe_source_run_id": recipe.source_run_id,
             "recipe_source_task_id": recipe.source_task_id,
         }
-        try:
-            self.client.record_verified_action_cache_telemetry(payload)
-        except (AttributeError, CortexOpsControlError, TypeError, ValueError):
+        if not self._record_cache_telemetry(payload):
             return False
         self._cache.metrics.successful_reuse += 1
         self._cache.metrics.tokens_avoided += recipe.original_token_usage
@@ -893,6 +1215,45 @@ class HermesControlAdapter:
                 (run["run_id"],),
             )
         return True
+
+    def _record_cache_telemetry(self, payload: Mapping[str, Any]) -> bool:
+        """Record a cache measurement without losing it to an older control API.
+
+        Provider and pricing fields are additive metadata.  A locally running
+        CortexOps process can briefly lag the installed plugin during an
+        upgrade; retry the otherwise identical measurement without those
+        optional fields only when that older schema explicitly rejects them.
+        Other control-plane failures remain fail-closed for cache reuse.
+        """
+
+        try:
+            self.client.record_verified_action_cache_telemetry(payload)
+            return True
+        except CortexOpsControlRejected as error:
+            if "Extra inputs are not permitted" not in str(error):
+                return False
+            legacy_payload = dict(payload)
+            for measurement_name in ("baseline", "reused"):
+                measurement = legacy_payload.get(measurement_name)
+                if not isinstance(measurement, Mapping):
+                    continue
+                legacy_payload[measurement_name] = {
+                    key: value
+                    for key, value in measurement.items()
+                    if key not in {
+                        "provider",
+                        "model",
+                        "cost_status",
+                        "cost_source",
+                    }
+                }
+            try:
+                self.client.record_verified_action_cache_telemetry(legacy_payload)
+                return True
+            except (AttributeError, CortexOpsControlError, TypeError, ValueError):
+                return False
+        except (AttributeError, CortexOpsControlError, TypeError, ValueError):
+            return False
 
     def _recipe_by_id(self, recipe_id: str) -> VerifiedActionRecipe | None:
         with self._db() as db:
@@ -917,6 +1278,8 @@ class HermesControlAdapter:
         kw: Mapping[str, Any],
         tool: ToolDescriptor,
         args_hash: str,
+        *,
+        args_template_hash: str | None = None,
     ) -> tuple[str, CacheMatch | None, tuple[PreconditionResult, ...]]:
         """Bind a pre-LLM candidate to fresh current-call facts."""
 
@@ -939,6 +1302,14 @@ class HermesControlAdapter:
             kind=CacheMatchKind(str(run["match_type"])),
             score=float(run["match_confidence"]),
         )
+        if match.kind.value == "parameterized" and args_template_hash is None:
+            parameterized = self._parameterized_replay_args(
+                recipe, str(run["task_intent"])
+            )
+            if parameterized is not None:
+                bound_args, candidate_template_hash = parameterized
+                if _hash(bound_args) == args_hash:
+                    args_template_hash = candidate_template_hash
         probe_material = self._probe_for(tool.name, tool.capability)
         validation = tuple(
             _HermesRecipePreconditionValidator(
@@ -947,6 +1318,7 @@ class HermesControlAdapter:
                 probe_hash=_hash(
                     {"probe": redact(probe_material, self.config.redact_keys)}
                 ),
+                args_template_hash=args_template_hash,
             ).validate(
                 recipe,
                 ReuseRequest(
@@ -975,13 +1347,23 @@ class HermesControlAdapter:
             pass
         input_tokens = int(run["input_tokens"])
         output_tokens = int(run["output_tokens"])
-        return {
+        measurement: dict[str, Any] = {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": input_tokens + output_tokens,
             "duration_ms": duration_ms,
             "kind": "measured",
         }
+        if (
+            run["usage_observed"]
+            and run["cost_complete"]
+            and run["estimated_cost_usd"] is not None
+        ):
+            measurement["estimated_cost_usd"] = float(run["estimated_cost_usd"])
+        for metadata_key in ("provider", "model", "cost_status", "cost_source"):
+            if run[metadata_key] is not None:
+                measurement[metadata_key] = str(run[metadata_key])
+        return measurement
 
     def _new_recipe(
         self,
@@ -1012,6 +1394,7 @@ class HermesControlAdapter:
         expected_outcome = dict(expected) if isinstance(expected, Mapping) else {}
         replay_args = request.get("replay_args")
         replay = None
+        parameterized_replay = None
         if (
             isinstance(replay_args, Mapping)
             and isinstance(final_response, str)
@@ -1024,6 +1407,9 @@ class HermesControlAdapter:
                     "args": safe_args,
                     "final_response": final_response,
                 }
+                parameterized_replay = _parameterized_recipe(
+                    str(run["task_intent"]), safe_args
+                )
         strategy: dict[str, Any] = {
             "tool": tool_name,
             "capability": str(descriptor["capability"]),
@@ -1034,6 +1420,8 @@ class HermesControlAdapter:
         }
         if replay is not None:
             strategy["replay"] = replay
+        if parameterized_replay is not None:
+            strategy["parameterized_replay"] = parameterized_replay
         return VerifiedActionRecipe(
             recipe_id=recipe_id,
             normalized_task_intent=str(run["task_intent"]),
@@ -1050,6 +1438,11 @@ class HermesControlAdapter:
                 "capability": str(descriptor["capability"]),
                 "tool_descriptor_hash": _hash({"descriptor": descriptor}),
                 "args_hash": str(request["args_hash"]),
+                **(
+                    {"args_template_hash": parameterized_replay["args_template_hash"]}
+                    if parameterized_replay is not None
+                    else {}
+                ),
                 "probe_hash": _hash(
                     {"probe": redact(probe_material, self.config.redact_keys)}
                 ),
@@ -1181,9 +1574,7 @@ class HermesControlAdapter:
                     "recipe_source_task_id": recipe.source_task_id,
                 }
             )
-        try:
-            self.client.record_verified_action_cache_telemetry(payload)
-        except (AttributeError, CortexOpsControlError, TypeError, ValueError):
+        if not self._record_cache_telemetry(payload):
             return
 
         if new_recipe is not None:

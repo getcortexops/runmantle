@@ -67,6 +67,8 @@ class _Transport:
             return value
         if path == "/api/runmantle/v1/tasks/status":
             return {"verified_status": "verified"}
+        if path.startswith("/api/runmantle/v1/tasks/"):
+            return {"verified_status": "verified"}
         return {"ok": True}
 
 
@@ -143,6 +145,28 @@ class _ResetRecoveringClient(_Client):
                 "'Runmantle runtime is not registered'"
             )
         return {"ok": True}
+
+
+class _LegacyTelemetryClient(_Client):
+    """Simulate a CortexOps process that predates optional cost metadata."""
+
+    def __init__(self) -> None:
+        super().__init__("ALLOW")
+        self.telemetry_attempts: list[dict[str, Any]] = []
+
+    def record_verified_action_cache_telemetry(
+        self, payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        document = dict(payload)
+        self.telemetry_attempts.append(document)
+        baseline = document.get("baseline")
+        if isinstance(baseline, Mapping) and "provider" in baseline:
+            raise CortexOpsControlRejected(
+                "CortexOps control rejected request (422): "
+                "Extra inputs are not permitted"
+            )
+        self.cache_telemetry.append(document)
+        return document
 
 
 class _Request:
@@ -374,6 +398,9 @@ def _run_verified_cache_turn(
     call_id: str,
     input_tokens: int,
     output_tokens: int,
+    estimated_cost_usd: float | None = None,
+    intent: str = "Deploy version two to the local service",
+    args: Mapping[str, Any] | None = None,
 ) -> dict[str, str] | None:
     common = {
         "task_id": task_id,
@@ -382,25 +409,37 @@ def _run_verified_cache_turn(
     }
     context = adapter.pre_llm_call(
         **common,
-        user_message="Deploy version two to the local service",
+        user_message=intent,
     )
+    usage: dict[str, Any] = {
+        "prompt_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
+    if estimated_cost_usd is not None:
+        usage.update({
+            "estimated_cost_usd": estimated_cost_usd,
+            "cost_status": "estimated",
+            "cost_source": "official_docs_snapshot",
+        })
     adapter.post_api_request(
         **common,
         api_request_id=f"{turn_id}-plan",
-        usage={"prompt_tokens": input_tokens, "output_tokens": output_tokens},
+        usage=usage,
         api_duration=0.01,
+        provider="openai",
+        response_model="gpt-5.6-luna",
     )
     call = {
         **common,
         "tool_name": "terminal",
         "tool_call_id": call_id,
-        "args": {"command": "deploy-v2"},
+        "args": dict(args or {"command": "deploy-v2"}),
     }
     assert adapter.pre_tool_call(**call) is None
     adapter.post_tool_call(**call, status="ok", result="deployed", duration_ms=2)
     adapter.post_llm_call(
         **common,
-        user_message="Deploy version two to the local service",
+        user_message=intent,
         assistant_response="Deployment complete.",
     )
     return context
@@ -521,12 +560,130 @@ def test_exact_verified_recipe_completes_pre_model_with_zero_measured_tokens(
         "output_tokens": 0,
         "total_tokens": 0,
         "duration_ms": 2,
+        "provider": "openai",
+        "model": "gpt-5.6-luna",
         "kind": "measured",
     }
     assert "provider_request_avoided" not in reused
     assert "args" not in reused
     assert "final_response" not in reused
     assert adapter._cache.metrics.tokens_avoided == 100
+
+
+def test_verified_recipe_reuse_preserves_model_metadata_and_measured_cost(
+    tmp_path: Path,
+) -> None:
+    adapter, client = _cache_adapter(tmp_path)
+    with patch(
+        "runmantle.integrations.hermes_control.urlopen",
+        side_effect=_probe_urlopen,
+    ):
+        _run_verified_cache_turn(
+            adapter,
+            task_id="task-baseline",
+            turn_id="run-baseline",
+            call_id="call-baseline",
+            input_tokens=80,
+            output_tokens=20,
+            estimated_cost_usd=0.0015,
+        )
+        hook_args, _ = _prepare_pre_model_reuse(adapter)
+        assert adapter.pre_model_completion(**hook_args) is not None
+
+    baseline, reused = client.cache_telemetry
+    assert baseline["baseline"] == {
+        "input_tokens": 80,
+        "output_tokens": 20,
+        "total_tokens": 100,
+        "duration_ms": 12,
+        "estimated_cost_usd": 0.0015,
+        "provider": "openai",
+        "model": "gpt-5.6-luna",
+        "cost_status": "estimated",
+        "cost_source": "official_docs_snapshot",
+        "kind": "measured",
+    }
+    assert reused["reused"]["estimated_cost_usd"] == 0.0
+    assert reused["reused"]["provider"] == "openai"
+    assert reused["reused"]["model"] == "gpt-5.6-luna"
+
+
+def test_cache_baseline_retries_without_optional_metadata_for_legacy_cortexops(
+    tmp_path: Path,
+) -> None:
+    adapter, _ = _cache_adapter(tmp_path)
+    client = _LegacyTelemetryClient()
+    adapter.client = cast(Any, client)
+    with patch(
+        "runmantle.integrations.hermes_control.urlopen",
+        side_effect=_probe_urlopen,
+    ):
+        _run_verified_cache_turn(
+            adapter,
+            task_id="task-legacy-baseline",
+            turn_id="run-legacy-baseline",
+            call_id="call-legacy-baseline",
+            input_tokens=80,
+            output_tokens=20,
+        )
+
+    assert len(client.telemetry_attempts) == 2
+    assert "provider" in client.telemetry_attempts[0]["baseline"]
+    assert "provider" not in client.cache_telemetry[0]["baseline"]
+    with adapter._db() as db:
+        finalized = db.execute(
+            "SELECT finalized FROM hermes_cache_runs WHERE run_id=?",
+            ("run-legacy-baseline",),
+        ).fetchone()[0]
+    assert finalized == 1
+
+
+def test_parameterized_recipe_reuses_a_verified_workflow_with_changed_arguments(
+    tmp_path: Path,
+) -> None:
+    adapter, client = _cache_adapter(tmp_path)
+    original_intent = (
+        "Create /tmp/cortexops-cache-demo.txt with exactly this content: "
+        "VERSION=1"
+    )
+    changed_intent = (
+        "Create /tmp/cortexops-cache-demo2.txt with exactly this content: "
+        "VERSION=2"
+    )
+    with patch(
+        "runmantle.integrations.hermes_control.urlopen",
+        side_effect=_probe_urlopen,
+    ):
+        _run_verified_cache_turn(
+            adapter,
+            task_id="task-template-baseline",
+            turn_id="run-template-baseline",
+            call_id="call-template-baseline",
+            input_tokens=80,
+            output_tokens=20,
+            intent=original_intent,
+            args={"path": "/tmp/cortexops-cache-demo.txt", "content": "VERSION=1"},
+        )
+        hook_args, dispatches = _prepare_pre_model_reuse(
+            adapter,
+            intent=changed_intent,
+        )
+        expected_response = (
+            "Completed the governed action and independently verified "
+            "the requested outcome."
+        )
+        assert adapter.pre_model_completion(**hook_args) == {
+            "complete_turn": True,
+            "response": expected_response,
+        }
+
+    assert dispatches == [{
+        "directive": None,
+        "args": {"path": "/tmp/cortexops-cache-demo2.txt", "content": "VERSION=2"},
+    }]
+    reused = client.cache_telemetry[-1]
+    assert reused["match_type"] == "parameterized"
+    assert reused["reused"]["total_tokens"] == 0
 
 
 def test_similar_recipe_never_dispatches_pre_model(tmp_path: Path) -> None:
@@ -577,6 +734,44 @@ def test_unavailable_replay_tool_falls_back_without_dispatch(tmp_path: Path) -> 
 
     assert completed is None
     assert dispatches == []
+
+
+def test_missing_recipe_source_discards_stale_recipe_before_replay(
+    tmp_path: Path,
+) -> None:
+    adapter, client = _cache_adapter(tmp_path)
+    with patch(
+        "runmantle.integrations.hermes_control.urlopen",
+        side_effect=_probe_urlopen,
+    ):
+        _run_verified_cache_turn(
+            adapter,
+            task_id="task-baseline",
+            turn_id="run-baseline",
+            call_id="call-baseline",
+            input_tokens=80,
+            output_tokens=20,
+        )
+        client.transport.request = lambda method, path, payload=None: (
+            {"verified_status": "verified"}
+            if path == "/api/runmantle/v1/tasks/status"
+            else (_ for _ in ()).throw(CortexOpsControlRejected("source missing"))
+        )
+        hook_args, dispatches = _prepare_pre_model_reuse(adapter)
+        completed = adapter.pre_model_completion(**hook_args)
+
+    assert completed is None
+    assert dispatches == []
+    with adapter._db() as db:
+        recipe_count = db.execute(
+            "SELECT COUNT(*) FROM hermes_verified_recipes"
+        ).fetchone()[0]
+        assert recipe_count == 0
+        row = db.execute(
+            "SELECT candidate_recipe_id FROM hermes_cache_runs WHERE run_id=?",
+            ("run-pre-model",),
+        ).fetchone()
+    assert row["candidate_recipe_id"] is None
 
 
 def test_denied_pre_model_replay_never_completes_early(tmp_path: Path) -> None:

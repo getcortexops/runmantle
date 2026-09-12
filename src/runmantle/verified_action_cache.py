@@ -185,6 +185,7 @@ class NormalizedIntentSimilarityMatcher:
 
 class CacheMatchKind(StrEnum):
     EXACT = "exact"
+    PARAMETERIZED = "parameterized"
     SIMILAR = "similar"
 
 
@@ -300,6 +301,20 @@ class VerifiedActionCache:
         if not recipe.successful or not recipe.verified:
             raise ValueError("only successful, verified recipes may be cached")
         self._recipes[recipe.recipe_id] = recipe
+
+    def discard(self, recipe_id: str) -> None:
+        """Forget a recipe whose durable source is no longer available."""
+
+        self._recipes.pop(recipe_id, None)
+
+    def recipes(self) -> tuple[VerifiedActionRecipe, ...]:
+        """Return verified recipes for a host-owned conservative matcher."""
+
+        return tuple(
+            recipe
+            for recipe in self._recipes.values()
+            if recipe.successful and recipe.verified
+        )
 
     def lookup(self, request: ReuseRequest) -> CacheMatch | None:
         """Find an exact match before considering the pluggable similarity path."""
