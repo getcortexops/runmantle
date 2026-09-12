@@ -282,13 +282,15 @@ def test_hermes_measured_baseline_then_verified_reuse_has_no_provider_usage(
             "session_id": "session-task-cache-reuse",
             "turn_id": "run-cache-reuse",
         }
-        assert adapter.pre_llm_call(
-            **reuse_common,
-            user_message="Deploy version two to the local service",
-        ) is not None
-        def dispatch_replay(
-            tool_name: str, args: dict[str, Any]
-        ) -> dict[str, str]:
+        assert (
+            adapter.pre_llm_call(
+                **reuse_common,
+                user_message="Deploy version two to the local service",
+            )
+            is not None
+        )
+
+        def dispatch_replay(tool_name: str, args: dict[str, Any]) -> dict[str, str]:
             call = {
                 **reuse_common,
                 "tool_name": tool_name,
@@ -312,9 +314,10 @@ def test_hermes_measured_baseline_then_verified_reuse_has_no_provider_usage(
                     "reason": "reviewed again",
                 },
             )
-            assert adapter.present_approval(
-                _ApprovalRequest(call["tool_call_id"])
-            ) == "once"
+            assert (
+                adapter.present_approval(_ApprovalRequest(call["tool_call_id"]))
+                == "once"
+            )
             adapter.post_tool_call(
                 **call,
                 status="ok",

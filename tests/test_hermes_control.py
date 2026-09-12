@@ -215,12 +215,11 @@ def _call() -> dict[str, Any]:
 
 def test_replay_material_rejects_sensitive_or_non_json_arguments() -> None:
     keys = frozenset({"authorization", "token", "secret", "password", "api_key"})
-    assert _safe_replay_args({"command": "deploy-v2"}, keys) == {
-        "command": "deploy-v2"
-    }
-    assert _safe_replay_args(
-        {"command": "deploy-v2", "token": "do-not-store"}, keys
-    ) is None
+    assert _safe_replay_args({"command": "deploy-v2"}, keys) == {"command": "deploy-v2"}
+    assert (
+        _safe_replay_args({"command": "deploy-v2", "token": "do-not-store"}, keys)
+        is None
+    )
     assert _safe_replay_args({"values": {1, 2}}, keys) is None
 
 
@@ -416,11 +415,13 @@ def _run_verified_cache_turn(
         "output_tokens": output_tokens,
     }
     if estimated_cost_usd is not None:
-        usage.update({
-            "estimated_cost_usd": estimated_cost_usd,
-            "cost_status": "estimated",
-            "cost_source": "official_docs_snapshot",
-        })
+        usage.update(
+            {
+                "estimated_cost_usd": estimated_cost_usd,
+                "cost_status": "estimated",
+                "cost_source": "official_docs_snapshot",
+            }
+        )
     adapter.post_api_request(
         **common,
         api_request_id=f"{turn_id}-plan",
@@ -643,12 +644,10 @@ def test_parameterized_recipe_reuses_a_verified_workflow_with_changed_arguments(
 ) -> None:
     adapter, client = _cache_adapter(tmp_path)
     original_intent = (
-        "Create /tmp/cortexops-cache-demo.txt with exactly this content: "
-        "VERSION=1"
+        "Create /tmp/cortexops-cache-demo.txt with exactly this content: VERSION=1"
     )
     changed_intent = (
-        "Create /tmp/cortexops-cache-demo2.txt with exactly this content: "
-        "VERSION=2"
+        "Create /tmp/cortexops-cache-demo2.txt with exactly this content: VERSION=2"
     )
     with patch(
         "runmantle.integrations.hermes_control.urlopen",
@@ -677,10 +676,12 @@ def test_parameterized_recipe_reuses_a_verified_workflow_with_changed_arguments(
             "response": expected_response,
         }
 
-    assert dispatches == [{
-        "directive": None,
-        "args": {"path": "/tmp/cortexops-cache-demo2.txt", "content": "VERSION=2"},
-    }]
+    assert dispatches == [
+        {
+            "directive": None,
+            "args": {"path": "/tmp/cortexops-cache-demo2.txt", "content": "VERSION=2"},
+        }
+    ]
     reused = client.cache_telemetry[-1]
     assert reused["match_type"] == "parameterized"
     assert reused["reused"]["total_tokens"] == 0

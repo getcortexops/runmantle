@@ -6,6 +6,13 @@ All notable changes to Runmantle are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-09-12
+
+### Fixed
+
+- normalize the Hermes cache integration and its regression coverage with the
+  repository's required Ruff formatting, restoring the release quality gate.
+
 ## [1.3.0] - 2026-09-12
 
 ### Added

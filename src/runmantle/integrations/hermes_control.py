@@ -224,9 +224,7 @@ def _parameterized_recipe(
     }
 
 
-def _parameter_values(
-    intent_segments: Any, intent: str
-) -> dict[str, str] | None:
+def _parameter_values(intent_segments: Any, intent: str) -> dict[str, str] | None:
     if not isinstance(intent_segments, (list, tuple)) or not intent_segments:
         return None
     pattern: list[str] = ["^"]
@@ -466,8 +464,7 @@ class _HermesRecipePreconditionValidator:
                 expected.get("args_hash") == self.args_hash
                 or (
                     self.args_template_hash is not None
-                    and expected.get("args_template_hash")
-                    == self.args_template_hash
+                    and expected.get("args_template_hash") == self.args_template_hash
                 ),
                 "the current argument identity or verified template matches the recipe",
             ),
@@ -1240,7 +1237,8 @@ class HermesControlAdapter:
                 legacy_payload[measurement_name] = {
                     key: value
                     for key, value in measurement.items()
-                    if key not in {
+                    if key
+                    not in {
                         "provider",
                         "model",
                         "cost_status",
